@@ -340,4 +340,67 @@ mod tests {
         };
         assert!(policy.hard_input_limit().is_err());
     }
+
+    #[test]
+    /// 验证估算值刚好等于软阈值时不会误触发裁剪。
+    fn keeps_context_exactly_at_soft_limit() {
+        let mut memory = ContextMemory::new("s");
+        append_turn(&mut memory, "a", "b");
+        let prepared = builder(13).prepare(&memory, &json!([])).unwrap();
+        assert_eq!(prepared.estimated_tokens(), 13);
+        assert!(!prepared.truncated());
+        assert_eq!(prepared.messages(), memory.messages());
+    }
+
+    #[test]
+    /// 验证工具 Schema 也计入预算，并能单独触发旧 Turn 裁剪。
+    fn counts_tool_schema_when_selecting_history() {
+        let mut memory = ContextMemory::new("s");
+        append_turn(&mut memory, "a", "b");
+        append_turn(&mut memory, "c", "d");
+        let context_builder = builder(30);
+        let without_large_tools = context_builder.prepare(&memory, &json!([])).unwrap();
+        let with_large_tools = context_builder
+            .prepare(
+                &memory,
+                &json!([{"name": "large", "description": "xxxxxxxxxxxxxxxxxxxx"}]),
+            )
+            .unwrap();
+        assert!(!without_large_tools.truncated());
+        assert!(with_large_tools.truncated());
+        assert_eq!(with_large_tools.messages(), &memory.messages()[2..]);
+    }
+
+    #[test]
+    /// 验证触发整理后，即使预算仍有空间也遵守最近 Turn 数量上限。
+    fn respects_recent_turn_count_limit_after_compaction() {
+        let mut memory = ContextMemory::new("s");
+        append_turn(&mut memory, "a", "1");
+        append_turn(&mut memory, "b", "2");
+        append_turn(&mut memory, "c", "3");
+        append_turn(&mut memory, "d", "4");
+        let context_builder = ContextBuilder::new(
+            ContextPolicy {
+                max_context_tokens: 100,
+                reserved_output_tokens: 10,
+                compact_at_tokens: 25,
+                recent_turns_to_keep: 2,
+            },
+            CharacterEstimator,
+        );
+        let prepared = context_builder.prepare(&memory, &json!([])).unwrap();
+        assert!(prepared.truncated());
+        assert_eq!(prepared.messages(), &memory.messages()[4..]);
+    }
+
+    #[test]
+    /// 验证当前 Turn 可超过软阈值，只要仍未超过硬输入上限。
+    fn keeps_current_turn_above_soft_limit() {
+        let mut memory = ContextMemory::new("s");
+        append_turn(&mut memory, &"x".repeat(30), &"y".repeat(10));
+        let prepared = builder(20).prepare(&memory, &json!([])).unwrap();
+        assert!(prepared.estimated_tokens() > 20);
+        assert!(!prepared.truncated());
+        assert_eq!(prepared.messages(), memory.messages());
+    }
 }
