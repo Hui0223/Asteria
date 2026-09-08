@@ -1,4 +1,4 @@
-use crate::{context::ContextMemory, message::ToolCall};
+use crate::{context_builder::PreparedContext, message::ToolCall};
 use anyhow::Result;
 use serde_json::Value;
 
@@ -16,6 +16,6 @@ pub trait ModelProvider {
     /// 返回当前供应商实际使用的模型名称。
     fn model(&self) -> &str;
 
-    /// 根据完整上下文和工具定义生成下一个助手消息。
-    fn complete(&self, context: &ContextMemory, tools: Value) -> Result<AssistantTurn>;
+    /// 根据预算化上下文和工具定义生成下一个助手消息。
+    fn complete(&self, context: &PreparedContext, tools: Value) -> Result<AssistantTurn>;
 }

@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod agent_loop;
 pub mod context;
+pub mod context_builder;
 pub mod message;
 pub mod provider;
 pub mod tools;

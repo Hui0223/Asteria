@@ -1,4 +1,9 @@
-use crate::{context::ContextMemory, provider::ModelProvider, tools};
+use crate::{
+    context::ContextMemory,
+    context_builder::{ContextBuilder, ContextPolicy, HeuristicTokenEstimator},
+    provider::ModelProvider,
+    tools,
+};
 use anyhow::{Result, bail};
 use std::sync::{
     Arc,
@@ -23,6 +28,8 @@ pub struct TurnReport {
     pub state: TurnState,
     pub state_history: Vec<TurnState>,
     pub answer: Option<String>,
+    pub latest_context_tokens: usize,
+    pub context_truncated: bool,
 }
 
 /// 控制单个 Turn 最多允许多少次“模型思考 → 工具处理”的 Step。
@@ -62,16 +69,27 @@ pub struct AgentLoop<P> {
     config: LoopConfig,
     next_turn_id: u64,
     last_turn: Option<TurnReport>,
+    context_builder: ContextBuilder<HeuristicTokenEstimator>,
 }
 
 impl<P: ModelProvider> AgentLoop<P> {
     /// 使用给定供应商和循环配置创建 Agent Loop。
     pub fn new(provider: P, config: LoopConfig) -> Self {
+        Self::with_context_policy(provider, config, ContextPolicy::default())
+    }
+
+    /// 使用自定义上下文预算创建 Agent Loop，便于按模型能力调整窗口。
+    pub fn with_context_policy(
+        provider: P,
+        config: LoopConfig,
+        context_policy: ContextPolicy,
+    ) -> Self {
         Self {
             provider,
             config,
             next_turn_id: 1,
             last_turn: None,
+            context_builder: ContextBuilder::new(context_policy, HeuristicTokenEstimator),
         }
     }
 
@@ -114,6 +132,8 @@ impl<P: ModelProvider> AgentLoop<P> {
             state: TurnState::Running,
             state_history: vec![TurnState::Running],
             answer: None,
+            latest_context_tokens: 0,
+            context_truncated: false,
         });
     }
 
@@ -130,7 +150,10 @@ impl<P: ModelProvider> AgentLoop<P> {
         for _ in 0..self.config.max_steps_per_turn {
             self.ensure_not_cancelled(cancel)?;
             self.increment_steps();
-            let message = self.provider.complete(context, tools::schema())?;
+            let tool_schema = tools::schema();
+            let prepared = self.context_builder.prepare(context, &tool_schema)?;
+            self.record_prepared_context(prepared.estimated_tokens(), prepared.truncated());
+            let message = self.provider.complete(&prepared, tool_schema)?;
             let calls = message.tool_calls;
             context.append_assistant(message.content.clone(), calls.clone())?;
 
@@ -167,6 +190,14 @@ impl<P: ModelProvider> AgentLoop<P> {
         }
     }
 
+    /// 记录当前 Step 发送给模型的估算 Token 数和裁剪状态。
+    fn record_prepared_context(&mut self, estimated_tokens: usize, truncated: bool) {
+        if let Some(turn) = &mut self.last_turn {
+            turn.latest_context_tokens = estimated_tokens;
+            turn.context_truncated |= truncated;
+        }
+    }
+
     /// 更新当前 Turn 状态，并保留去重后的状态变化轨迹。
     fn transition(&mut self, state: TurnState) {
         if let Some(turn) = &mut self.last_turn {
@@ -196,7 +227,7 @@ impl<P: ModelProvider> AgentLoop<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{message::ToolCall, provider::AssistantTurn};
+    use crate::{context_builder::PreparedContext, message::ToolCall, provider::AssistantTurn};
     use anyhow::{Context, Result};
     use serde_json::Value;
     use std::{cell::RefCell, collections::VecDeque};
@@ -222,7 +253,7 @@ mod tests {
         }
 
         /// 弹出下一个预设响应，模拟模型完成一个 Step。
-        fn complete(&self, _context: &ContextMemory, _tools: Value) -> Result<AssistantTurn> {
+        fn complete(&self, _context: &PreparedContext, _tools: Value) -> Result<AssistantTurn> {
             self.responses
                 .borrow_mut()
                 .pop_front()

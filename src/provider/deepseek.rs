@@ -1,5 +1,5 @@
 use crate::{
-    context::ContextMemory,
+    context_builder::PreparedContext,
     message::{Message, ToolCall},
     provider::{AssistantTurn, ModelProvider},
 };
@@ -29,14 +29,14 @@ impl DeepSeekProvider {
     }
 
     /// 执行一次 DeepSeek HTTP 请求并解析为统一助手消息。
-    fn request(&self, context: &ContextMemory, tools: Value) -> Result<AssistantTurn> {
+    fn request(&self, context: &PreparedContext, tools: Value) -> Result<AssistantTurn> {
         let response: ChatResponse = self
             .client
             .post(API_URL)
             .bearer_auth(&self.api_key)
             .json(&json!({
                 "model": self.model,
-                "messages": project(context)?,
+                "messages": project(context),
                 "tools": tools,
                 "tool_choice": "auto",
                 "thinking": {"type": "disabled"}
@@ -76,14 +76,13 @@ impl ModelProvider for DeepSeekProvider {
     }
 
     /// 把中立上下文转换成 DeepSeek 协议并完成一个模型 Step。
-    fn complete(&self, context: &ContextMemory, tools: Value) -> Result<AssistantTurn> {
+    fn complete(&self, context: &PreparedContext, tools: Value) -> Result<AssistantTurn> {
         self.request(context, tools)
     }
 }
 
 /// 把内部强类型消息投影为 DeepSeek Chat Completions 的 JSON 消息。
-fn project(context: &ContextMemory) -> Result<Vec<Value>> {
-    context.validate()?;
+fn project(context: &PreparedContext) -> Vec<Value> {
     let mut wire = vec![json!({"role": "system", "content": context.system_prompt()})];
     for message in context.messages() {
         wire.push(match message {
@@ -109,7 +108,7 @@ fn project(context: &ContextMemory) -> Result<Vec<Value>> {
             } => json!({"role": "tool", "tool_call_id": call_id, "content": content}),
         });
     }
-    Ok(wire)
+    wire
 }
 
 /// DeepSeek 顶层响应中当前任务需要读取的字段。
@@ -149,6 +148,17 @@ struct ResponseFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        context::ContextMemory,
+        context_builder::{ContextBuilder, ContextPolicy, HeuristicTokenEstimator},
+    };
+
+    /// 把测试记忆转换为不会裁剪消息的预算化上下文。
+    fn prepare(context: &ContextMemory) -> PreparedContext {
+        ContextBuilder::new(ContextPolicy::default(), HeuristicTokenEstimator)
+            .prepare(context, &json!([]))
+            .unwrap()
+    }
 
     /// 构造投影测试所需的工具调用。
     fn call(id: &str) -> ToolCall {
@@ -166,7 +176,7 @@ mod tests {
         context
             .append_assistant(Some("done".into()), Vec::new())
             .unwrap();
-        let projected = project(&context).unwrap();
+        let projected = project(&prepare(&context));
         assert!(projected[1].get("tool_calls").is_none());
     }
 
@@ -176,7 +186,7 @@ mod tests {
         let mut context = ContextMemory::new("system");
         context.append_assistant(None, vec![call("a")]).unwrap();
         context.append_tool_result("a", "2", false).unwrap();
-        let projected = project(&context).unwrap();
+        let projected = project(&prepare(&context));
         assert_eq!(projected[1]["tool_calls"][0]["id"], "a");
         assert_eq!(projected[2]["tool_call_id"], "a");
     }
