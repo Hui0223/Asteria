@@ -1,11 +1,13 @@
 use chrono::Local;
 use serde_json::{Value, json};
 
+/// 工具执行后的统一文本结果及错误标记。
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
 }
 
+/// 返回提供给模型的全部工具 JSON Schema。
 pub fn schema() -> Value {
     json!([
         {"type":"function","function":{
@@ -21,6 +23,7 @@ pub fn schema() -> Value {
     ])
 }
 
+/// 按名称解析参数并执行本地工具，把失败也转换成模型可读结果。
 pub fn execute(name: &str, raw_args: &str) -> ToolOutput {
     let result = (|| -> Result<String, String> {
         let args: Value = serde_json::from_str(raw_args).map_err(|error| error.to_string())?;

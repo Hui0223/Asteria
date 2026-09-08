@@ -1,14 +1,15 @@
 use crate::message::{Message, ToolCall};
 use anyhow::{Result, bail};
-use serde_json::{Value, json};
 use std::collections::HashSet;
 
+/// 保存与模型供应商无关的对话历史，并维护消息顺序约束。
 pub struct ContextMemory {
     system_prompt: String,
     messages: Vec<Message>,
 }
 
 impl ContextMemory {
+    /// 创建一份空的上下文记忆，并保存不会随重置丢失的系统提示词。
     pub fn new(system_prompt: impl Into<String>) -> Self {
         Self {
             system_prompt: system_prompt.into(),
@@ -16,18 +17,37 @@ impl ContextMemory {
         }
     }
 
+    /// 返回当前消息数量，作为稍后回滚时使用的检查点。
     pub fn checkpoint(&self) -> usize {
         self.messages.len()
     }
 
+    /// 删除检查点之后的所有消息，让上下文恢复到此前状态。
     pub fn rollback(&mut self, checkpoint: usize) {
         self.messages.truncate(checkpoint);
     }
 
+    /// 清空对话消息，但保留系统提示词。
     pub fn reset(&mut self) {
         self.messages.clear();
     }
 
+    /// 返回只读的系统提示词，供模型适配器组装请求。
+    pub fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
+    /// 返回只读的结构化消息，避免外部绕过校验直接修改历史。
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// 检查当前历史是否完整，尤其是所有工具调用是否已有结果。
+    pub fn validate(&self) -> Result<()> {
+        self.ensure_no_pending_tools()
+    }
+
+    /// 追加用户消息；若上一批工具调用尚未完成，则拒绝写入。
     pub fn append_user(&mut self, content: impl Into<String>) -> Result<()> {
         self.ensure_no_pending_tools()?;
         self.messages.push(Message::User {
@@ -36,6 +56,7 @@ impl ContextMemory {
         Ok(())
     }
 
+    /// 追加助手消息，并检查正文或工具调用至少存在一种。
     pub fn append_assistant(
         &mut self,
         content: Option<String>,
@@ -52,6 +73,7 @@ impl ContextMemory {
         Ok(())
     }
 
+    /// 追加工具结果，并确保它只匹配一个仍在等待中的调用 ID。
     pub fn append_tool_result(
         &mut self,
         call_id: impl Into<String>,
@@ -70,36 +92,7 @@ impl ContextMemory {
         Ok(())
     }
 
-    pub fn project_deepseek(&self) -> Result<Vec<Value>> {
-        self.ensure_no_pending_tools()?;
-        let mut wire = vec![json!({"role":"system", "content":self.system_prompt})];
-        for message in &self.messages {
-            wire.push(match message {
-                Message::User { content } => json!({"role":"user", "content":content}),
-                Message::Assistant {
-                    content,
-                    tool_calls,
-                } if tool_calls.is_empty() => json!({"role":"assistant", "content":content}),
-                Message::Assistant {
-                    content,
-                    tool_calls,
-                } => {
-                    json!({
-                        "role":"assistant", "content":content,
-                        "tool_calls":tool_calls.iter().map(|call| json!({
-                            "id":call.id, "type":"function",
-                            "function":{"name":call.name, "arguments":call.arguments}
-                        })).collect::<Vec<_>>()
-                    })
-                }
-                Message::Tool {
-                    call_id, content, ..
-                } => json!({"role":"tool", "tool_call_id":call_id, "content":content}),
-            });
-        }
-        Ok(wire)
-    }
-
+    /// 拒绝在工具调用结果不完整时开始下一段对话或发送模型请求。
     fn ensure_no_pending_tools(&self) -> Result<()> {
         let pending = self.pending_tool_ids()?;
         if !pending.is_empty() {
@@ -111,6 +104,7 @@ impl ContextMemory {
         Ok(())
     }
 
+    /// 扫描历史并返回尚未收到结果的工具调用 ID，同时检查配对顺序。
     fn pending_tool_ids(&self) -> Result<HashSet<String>> {
         let mut pending = HashSet::new();
         for message in &self.messages {
@@ -145,6 +139,7 @@ impl ContextMemory {
 mod tests {
     use super::*;
 
+    /// 构造测试使用的计算器工具调用。
     fn call(id: &str) -> ToolCall {
         ToolCall {
             id: id.into(),
@@ -154,26 +149,27 @@ mod tests {
     }
 
     #[test]
+    /// 验证重置只删除消息，不删除系统提示词。
     fn reset_keeps_system_prompt() {
         let mut context = ContextMemory::new("system");
         context.append_user("hello").unwrap();
         context.reset();
-        assert_eq!(
-            context.project_deepseek().unwrap(),
-            vec![json!({"role":"system","content":"system"})]
-        );
+        assert_eq!(context.system_prompt(), "system");
+        assert!(context.messages().is_empty());
     }
 
     #[test]
+    /// 验证回滚会准确删除当前轮新增的消息。
     fn rollback_removes_the_current_turn() {
         let mut context = ContextMemory::new("system");
         let checkpoint = context.checkpoint();
         context.append_user("temporary").unwrap();
         context.rollback(checkpoint);
-        assert_eq!(context.project_deepseek().unwrap().len(), 1);
+        assert!(context.messages().is_empty());
     }
 
     #[test]
+    /// 验证孤立或重复的工具结果会被拒绝。
     fn rejects_orphan_and_duplicate_tool_results() {
         let mut context = ContextMemory::new("system");
         assert!(context.append_tool_result("missing", "x", true).is_err());
@@ -183,24 +179,15 @@ mod tests {
     }
 
     #[test]
+    /// 验证并行工具调用可以乱序返回，但必须全部完成。
     fn parallel_results_match_by_call_id() {
         let mut context = ContextMemory::new("system");
         context
             .append_assistant(None, vec![call("a"), call("b")])
             .unwrap();
         context.append_tool_result("b", "4", false).unwrap();
-        assert!(context.project_deepseek().is_err());
+        assert!(context.validate().is_err());
         context.append_tool_result("a", "2", false).unwrap();
-        assert!(context.project_deepseek().is_ok());
-    }
-
-    #[test]
-    fn projection_omits_empty_tool_calls() {
-        let mut context = ContextMemory::new("system");
-        context
-            .append_assistant(Some("done".into()), Vec::new())
-            .unwrap();
-        let projected = context.project_deepseek().unwrap();
-        assert!(projected[1].get("tool_calls").is_none());
+        assert!(context.validate().is_ok());
     }
 }
