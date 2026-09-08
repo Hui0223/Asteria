@@ -1,0 +1,8 @@
+//! Asteria 的可复用核心库，包含上下文、模型适配器、工具和 Agent Loop。
+
+pub mod agent;
+pub mod agent_loop;
+pub mod context;
+pub mod message;
+pub mod provider;
+pub mod tools;

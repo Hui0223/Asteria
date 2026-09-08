@@ -1,11 +1,5 @@
-mod agent;
-mod context;
-mod message;
-mod provider;
-mod tools;
-
-use agent::Asteria;
 use anyhow::Result;
+use asteria_agent::agent::Asteria;
 use std::io::{self, Write};
 
 /// 启动命令行 Agent，并持续读取用户输入直到退出。

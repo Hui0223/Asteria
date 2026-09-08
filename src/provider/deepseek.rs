@@ -1,6 +1,7 @@
 use crate::{
     context::ContextMemory,
     message::{Message, ToolCall},
+    provider::{AssistantTurn, ModelProvider},
 };
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
@@ -9,13 +10,6 @@ use serde_json::{Value, json};
 use std::env;
 
 const API_URL: &str = "https://api.deepseek.com/chat/completions";
-
-/// 表示模型完成一个推理步骤后返回的统一助手消息。
-#[derive(Clone, Debug)]
-pub struct AssistantTurn {
-    pub content: Option<String>,
-    pub tool_calls: Vec<ToolCall>,
-}
 
 /// 封装 DeepSeek 的鉴权、请求协议和响应解析。
 pub struct DeepSeekProvider {
@@ -34,13 +28,8 @@ impl DeepSeekProvider {
         })
     }
 
-    /// 返回当前适配器实际使用的模型名称。
-    pub fn model(&self) -> &str {
-        &self.model
-    }
-
-    /// 把中立上下文转换成 DeepSeek 请求，并返回统一格式的助手消息。
-    pub fn complete(&self, context: &ContextMemory, tools: Value) -> Result<AssistantTurn> {
+    /// 执行一次 DeepSeek HTTP 请求并解析为统一助手消息。
+    fn request(&self, context: &ContextMemory, tools: Value) -> Result<AssistantTurn> {
         let response: ChatResponse = self
             .client
             .post(API_URL)
@@ -77,6 +66,18 @@ impl DeepSeekProvider {
                 })
                 .collect(),
         })
+    }
+}
+
+impl ModelProvider for DeepSeekProvider {
+    /// 向 Agent Loop 暴露当前 DeepSeek 模型名称。
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// 把中立上下文转换成 DeepSeek 协议并完成一个模型 Step。
+    fn complete(&self, context: &ContextMemory, tools: Value) -> Result<AssistantTurn> {
+        self.request(context, tools)
     }
 }
 
