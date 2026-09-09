@@ -22,7 +22,15 @@ fn main() -> Result<()> {
             }
             "" => {}
             text => match agent.ask(text) {
-                Ok(answer) => println!("Asteria: {answer}"),
+                Ok(answer) => {
+                    println!("Asteria: {answer}");
+                    if let Some(usage) = agent.last_usage() {
+                        println!(
+                            "[Token Usage] input={} output={} total={}",
+                            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+                        );
+                    }
+                }
                 Err(error) => eprintln!("错误: {error:#}"),
             },
         }

@@ -1,7 +1,7 @@
 use crate::{
     context_builder::PreparedContext,
     message::{Message, ToolCall},
-    provider::{AssistantTurn, ModelProvider},
+    provider::{AssistantTurn, ModelProvider, TokenUsage},
 };
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
@@ -65,6 +65,11 @@ impl DeepSeekProvider {
                     arguments: call.function.arguments,
                 })
                 .collect(),
+            usage: response.usage.map(|usage| TokenUsage {
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+            }),
         })
     }
 }
@@ -121,6 +126,16 @@ fn project(context: &PreparedContext) -> Vec<Value> {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<ResponseUsage>,
+}
+
+/// DeepSeek usage 对象中的输入、输出和总 Token 数。
+#[derive(Deserialize)]
+struct ResponseUsage {
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    total_tokens: usize,
 }
 
 /// DeepSeek 候选答案中的消息包装层。

@@ -1,7 +1,7 @@
 use crate::{
     context::ContextMemory,
     context_builder::{ContextBuilder, ContextPolicy, HeuristicTokenEstimator},
-    provider::ModelProvider,
+    provider::{ModelProvider, TokenUsage},
     tools,
 };
 use anyhow::{Result, bail};
@@ -30,6 +30,7 @@ pub struct TurnReport {
     pub answer: Option<String>,
     pub latest_context_tokens: usize,
     pub context_truncated: bool,
+    pub usage: TokenUsage,
 }
 
 /// 控制单个 Turn 最多允许多少次“模型思考 → 工具处理”的 Step。
@@ -134,6 +135,7 @@ impl<P: ModelProvider> AgentLoop<P> {
             answer: None,
             latest_context_tokens: 0,
             context_truncated: false,
+            usage: TokenUsage::default(),
         });
     }
 
@@ -154,6 +156,9 @@ impl<P: ModelProvider> AgentLoop<P> {
             let prepared = self.context_builder.prepare(context, &tool_schema)?;
             self.record_prepared_context(prepared.estimated_tokens(), prepared.truncated());
             let message = self.provider.complete(&prepared, tool_schema)?;
+            if let Some(usage) = &message.usage {
+                self.record_usage(usage);
+            }
             let calls = message.tool_calls;
             context.append_assistant(message.content.clone(), calls.clone())?;
 
@@ -195,6 +200,15 @@ impl<P: ModelProvider> AgentLoop<P> {
         if let Some(turn) = &mut self.last_turn {
             turn.latest_context_tokens = estimated_tokens;
             turn.context_truncated |= truncated;
+        }
+    }
+
+    /// 累加当前 Step 的真实 Token 使用量，供整个 Turn 统计。
+    fn record_usage(&mut self, usage: &TokenUsage) {
+        if let Some(turn) = &mut self.last_turn {
+            turn.usage.prompt_tokens += usage.prompt_tokens;
+            turn.usage.completion_tokens += usage.completion_tokens;
+            turn.usage.total_tokens += usage.total_tokens;
         }
     }
 
@@ -266,6 +280,7 @@ mod tests {
         AssistantTurn {
             content: Some(content.into()),
             tool_calls: Vec::new(),
+            usage: None,
         }
     }
 
@@ -278,6 +293,7 @@ mod tests {
                 name: "calculate".into(),
                 arguments: "{\"expression\":\"1+1\"}".into(),
             }],
+            usage: None,
         }
     }
 

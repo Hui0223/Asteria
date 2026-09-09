@@ -1,6 +1,7 @@
 use crate::{
     agent_loop::{AgentLoop, CancelToken, LoopConfig},
     context::ContextMemory,
+    provider::TokenUsage,
     provider::deepseek::DeepSeekProvider,
 };
 use anyhow::Result;
@@ -25,6 +26,11 @@ impl Asteria {
     /// 返回当前 Agent 使用的模型名称。
     pub fn model(&self) -> &str {
         self.agent_loop.model()
+    }
+
+    /// 返回最近一个 Turn 的真实 Token 使用量；尚未请求模型时返回 None。
+    pub fn last_usage(&self) -> Option<&TokenUsage> {
+        self.agent_loop.last_turn().map(|turn| &turn.usage)
     }
 
     /// 清空对话历史，但保留 Agent 的系统设定。
