@@ -74,6 +74,7 @@ impl TokenEstimator for HeuristicTokenEstimator {
 #[derive(Clone, Debug)]
 pub struct PreparedContext {
     system_prompt: String,
+    summary: Option<String>,
     messages: Vec<Message>,
     estimated_tokens: usize,
     truncated: bool,
@@ -88,6 +89,11 @@ impl PreparedContext {
     /// 返回本次允许模型看到的消息，不代表完整历史已被删除。
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// 返回被裁剪旧 Turn 的摘要；没有裁剪时返回 None。
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
     }
 
     /// 返回包含系统提示、工具定义和消息的估算 Token 数。
@@ -129,6 +135,7 @@ impl<E: TokenEstimator> ContextBuilder<E> {
         if all_tokens <= target {
             return Ok(PreparedContext {
                 system_prompt: memory.system_prompt().to_owned(),
+                summary: None,
                 messages: memory.messages().to_vec(),
                 estimated_tokens: all_tokens,
                 truncated: false,
@@ -138,6 +145,7 @@ impl<E: TokenEstimator> ContextBuilder<E> {
         let Some(&(current_start, current_end)) = ranges.last() else {
             return Ok(PreparedContext {
                 system_prompt: memory.system_prompt().to_owned(),
+                summary: None,
                 messages: Vec::new(),
                 estimated_tokens: base_tokens,
                 truncated: false,
@@ -162,8 +170,22 @@ impl<E: TokenEstimator> ContextBuilder<E> {
         }
 
         let first_message = ranges[selected_start].0;
+        let summary = summarize_messages(&memory.messages()[..first_message]).and_then(|summary| {
+            let messages_tokens = self.estimate_messages(&memory.messages()[first_message..]);
+            let remaining = hard_limit.saturating_sub(base_tokens + messages_tokens);
+            (remaining > 0).then(|| fit_summary(&self.estimator, &summary, remaining))
+        });
+        let selected_tokens = base_tokens
+            + summary
+                .as_deref()
+                .map_or(0, |text| self.estimate_text(text))
+            + self.estimate_messages(&memory.messages()[first_message..]);
+        if selected_tokens > hard_limit {
+            bail!("摘要和当前上下文超过输入上限");
+        }
         Ok(PreparedContext {
             system_prompt: memory.system_prompt().to_owned(),
+            summary,
             messages: memory.messages()[first_message..].to_vec(),
             estimated_tokens: selected_tokens,
             truncated: first_message > 0,
@@ -205,6 +227,61 @@ impl<E: TokenEstimator> ContextBuilder<E> {
         8 + self.estimate_text(&call.id)
             + self.estimate_text(&call.name)
             + self.estimate_text(&call.arguments)
+    }
+}
+
+/// 为被省略的旧消息生成不依赖模型的保守摘要，避免摘要过程递归调用模型。
+fn summarize_messages(messages: &[Message]) -> Option<String> {
+    if messages.is_empty() {
+        return None;
+    }
+    let turn_count = turn_ranges(messages).len();
+    let first_user = messages.iter().find_map(|message| match message {
+        Message::User { content } => Some(compact_text(content)),
+        _ => None,
+    });
+    let last_assistant = messages.iter().rev().find_map(|message| match message {
+        Message::Assistant { content, .. } => content.as_deref().map(compact_text),
+        _ => None,
+    });
+    let mut parts = vec![format!("已省略 {turn_count} 个较早 Turn")];
+    if let Some(user) = first_user {
+        parts.push(format!("早期用户主题：{user}"));
+    }
+    if let Some(assistant) = last_assistant {
+        parts.push(format!("早期助手结论片段：{assistant}"));
+    }
+    Some(parts.join("；") + "。如需精确信息，请重新询问。")
+}
+
+/// 压缩摘要片段的长度并折叠空白，防止摘要反过来占满上下文预算。
+fn compact_text(text: &str) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut compacted = normalized.chars().take(120).collect::<String>();
+    if normalized.chars().count() > 120 {
+        compacted.push('…');
+    }
+    compacted
+}
+
+/// 将摘要裁剪到剩余预算内，同时保留摘要开头的 Turn 数量信息。
+fn fit_summary<E: TokenEstimator>(estimator: &E, summary: &str, max_tokens: usize) -> String {
+    if estimator.estimate_text(summary).max(1) <= max_tokens {
+        return summary.to_owned();
+    }
+    let mut chars = summary.chars().collect::<Vec<_>>();
+    while !chars.is_empty()
+        && estimator.estimate_text(&chars.iter().collect::<String>()) > max_tokens
+    {
+        let remove_count = (chars.len() / 10).max(1);
+        let new_len = chars.len().saturating_sub(remove_count);
+        chars.truncate(new_len);
+    }
+    let fitted = chars.into_iter().collect::<String>();
+    if fitted.is_empty() {
+        "…".to_owned()
+    } else {
+        fitted
     }
 }
 
@@ -286,6 +363,7 @@ mod tests {
         let prepared = builder(35).prepare(&memory, &json!([])).unwrap();
         assert!(prepared.truncated());
         assert_eq!(prepared.messages(), &memory.messages()[2..]);
+        assert!(prepared.summary().is_some());
     }
 
     #[test]

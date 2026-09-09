@@ -84,6 +84,12 @@ impl ModelProvider for DeepSeekProvider {
 /// 把内部强类型消息投影为 DeepSeek Chat Completions 的 JSON 消息。
 fn project(context: &PreparedContext) -> Vec<Value> {
     let mut wire = vec![json!({"role": "system", "content": context.system_prompt()})];
+    if let Some(summary) = context.summary() {
+        wire.push(json!({
+            "role": "user",
+            "content": format!("[Asteria 历史摘要]\n{summary}")
+        }));
+    }
     for message in context.messages() {
         wire.push(match message {
             Message::User { content } => json!({"role": "user", "content": content}),
@@ -189,5 +195,39 @@ mod tests {
         let projected = project(&prepare(&context));
         assert_eq!(projected[1]["tool_calls"][0]["id"], "a");
         assert_eq!(projected[2]["tool_call_id"], "a");
+    }
+
+    #[test]
+    /// 验证上下文摘要会在 DeepSeek JSON 中出现在历史消息之前。
+    fn projection_includes_compaction_summary() {
+        let mut context = ContextMemory::new("system");
+        context.append_user("old question").unwrap();
+        context
+            .append_assistant(Some("old answer".into()), Vec::new())
+            .unwrap();
+        context.append_user("new question").unwrap();
+        context
+            .append_assistant(Some("new answer".into()), Vec::new())
+            .unwrap();
+        let prepared = ContextBuilder::new(
+            ContextPolicy {
+                max_context_tokens: 100,
+                reserved_output_tokens: 10,
+                compact_at_tokens: 20,
+                recent_turns_to_keep: 1,
+            },
+            HeuristicTokenEstimator,
+        )
+        .prepare(&context, &json!([]))
+        .unwrap();
+        let projected = project(&prepared);
+        assert!(prepared.summary().is_some());
+        assert_eq!(projected[1]["role"], "user");
+        assert!(
+            projected[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("历史摘要")
+        );
     }
 }
