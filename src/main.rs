@@ -26,8 +26,13 @@ fn main() -> Result<()> {
                     println!("Asteria: {answer}");
                     if let Some(usage) = agent.last_usage() {
                         println!(
-                            "[Token Usage] input={} output={} total={}",
+                            "[Turn Token Usage] input={} output={} total={}",
                             usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+                        );
+                        let session = agent.session_usage();
+                        println!(
+                            "[Session Token Usage] input={} output={} total={}",
+                            session.prompt_tokens, session.completion_tokens, session.total_tokens
                         );
                     }
                 }

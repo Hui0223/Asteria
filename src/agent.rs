@@ -33,6 +33,11 @@ impl Asteria {
         self.agent_loop.last_turn().map(|turn| &turn.usage)
     }
 
+    /// 返回当前进程内所有 Turn 的累计 Token 使用量。
+    pub fn session_usage(&self) -> &TokenUsage {
+        self.agent_loop.session_usage()
+    }
+
     /// 清空对话历史，但保留 Agent 的系统设定。
     pub fn reset(&mut self) {
         self.context.reset();

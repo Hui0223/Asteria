@@ -71,6 +71,7 @@ pub struct AgentLoop<P> {
     next_turn_id: u64,
     last_turn: Option<TurnReport>,
     context_builder: ContextBuilder<HeuristicTokenEstimator>,
+    session_usage: TokenUsage,
 }
 
 impl<P: ModelProvider> AgentLoop<P> {
@@ -91,6 +92,7 @@ impl<P: ModelProvider> AgentLoop<P> {
             next_turn_id: 1,
             last_turn: None,
             context_builder: ContextBuilder::new(context_policy, HeuristicTokenEstimator),
+            session_usage: TokenUsage::default(),
         }
     }
 
@@ -102,6 +104,11 @@ impl<P: ModelProvider> AgentLoop<P> {
     /// 返回最近一个 Turn 的执行报告，便于观测和测试状态变化。
     pub fn last_turn(&self) -> Option<&TurnReport> {
         self.last_turn.as_ref()
+    }
+
+    /// 返回当前进程内所有已完成或部分执行 Turn 的累计 Token 使用量。
+    pub fn session_usage(&self) -> &TokenUsage {
+        &self.session_usage
     }
 
     /// 执行一个完整用户 Turn；失败或取消时自动回滚本 Turn 的上下文。
@@ -210,6 +217,9 @@ impl<P: ModelProvider> AgentLoop<P> {
             turn.usage.completion_tokens += usage.completion_tokens;
             turn.usage.total_tokens += usage.total_tokens;
         }
+        self.session_usage.prompt_tokens += usage.prompt_tokens;
+        self.session_usage.completion_tokens += usage.completion_tokens;
+        self.session_usage.total_tokens += usage.total_tokens;
     }
 
     /// 更新当前 Turn 状态，并保留去重后的状态变化轨迹。
@@ -388,5 +398,35 @@ mod tests {
             .run_turn(&mut context, "second", &CancelToken::default())
             .unwrap();
         assert_eq!(agent_loop.last_turn().unwrap().id, first_id + 1);
+    }
+
+    #[test]
+    /// 验证每个 Step 的 usage 同时累计到 Turn 和整个 Session。
+    fn accumulates_session_usage_across_turns() {
+        let mut first = answer("one");
+        first.usage = Some(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+        });
+        let mut second = answer("two");
+        second.usage = Some(TokenUsage {
+            prompt_tokens: 20,
+            completion_tokens: 3,
+            total_tokens: 23,
+        });
+        let provider = FakeProvider::new(vec![first, second]);
+        let mut agent_loop = AgentLoop::new(provider, LoopConfig::default());
+        let mut context = ContextMemory::new("system");
+
+        agent_loop
+            .run_turn(&mut context, "first", &CancelToken::default())
+            .unwrap();
+        assert_eq!(agent_loop.last_turn().unwrap().usage.total_tokens, 12);
+        agent_loop
+            .run_turn(&mut context, "second", &CancelToken::default())
+            .unwrap();
+        assert_eq!(agent_loop.last_turn().unwrap().usage.total_tokens, 23);
+        assert_eq!(agent_loop.session_usage().total_tokens, 35);
     }
 }
