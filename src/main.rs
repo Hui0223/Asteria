@@ -3,6 +3,7 @@ use asteria_agent::{
     agent::Asteria,
     agent_loop::{CancelToken, TurnState},
 };
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use tokio::sync::mpsc;
 
@@ -12,26 +13,32 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let mut agent = Asteria::new()?;
     println!(
-        "Asteria · {}  (/context 查看记忆，/usage 查看统计，/reset 清空记忆，/exit 退出；运行中 Ctrl+C 取消当前轮)",
+        "Asteria · {}  (/context 查看记忆，/usage 查看统计，/reset 清空记忆，/exit 退出；运行中 Ctrl+C 或 /cancel 回车取消当前轮)",
         agent.model()
     );
     let mut input_lines = read_input()?;
+    let mut queued = VecDeque::new();
     loop {
         print!("\n你: ");
         io::stdout().flush()?;
-        let input = tokio::select! {
-            line = input_lines.recv() => match line {
-                Some(line) => line?,
-                None => break,
-            },
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("无法监听 Ctrl+C")?;
-                println!("\n当前没有运行中的 Turn，输入 /exit 退出。");
-                continue;
+        let input = if let Some(line) = queued.pop_front() {
+            line
+        } else {
+            tokio::select! {
+                line = input_lines.recv() => match line {
+                    Some(line) => line?,
+                    None => break,
+                },
+                signal = tokio::signal::ctrl_c() => {
+                    signal.context("无法监听 Ctrl+C")?;
+                    println!("\n当前没有运行中的 Turn，输入 /exit 退出。");
+                    continue;
+                }
             }
         };
         match input.trim() {
             "/exit" => break,
+            "/cancel" => println!("当前没有运行中的 Turn。"),
             "/context" => print_context(&agent),
             "/usage" => print_usage(&agent),
             "/reset" => {
@@ -40,7 +47,7 @@ async fn main() -> Result<()> {
             }
             "" => {}
             text => {
-                match ask_interruptible(&mut agent, text).await {
+                match ask_interruptible(&mut agent, text, &mut input_lines, &mut queued).await {
                     Ok(answer) => println!("Asteria: {answer}"),
                     Err(_)
                         if agent
@@ -87,18 +94,45 @@ fn read_input() -> Result<mpsc::Receiver<io::Result<String>>> {
 }
 
 /// 同时等待回答和 Ctrl+C；只取消请求信号，继续等待 Turn 完成状态更新与回滚。
-async fn ask_interruptible(agent: &mut Asteria, input: &str) -> Result<String> {
+async fn ask_interruptible(
+    agent: &mut Asteria,
+    input: &str,
+    input_lines: &mut mpsc::Receiver<io::Result<String>>,
+    queued: &mut VecDeque<String>,
+) -> Result<String> {
     let cancel = CancelToken::new();
     let request = agent.ask_with_cancel(input, &cancel);
     tokio::pin!(request);
-    tokio::select! {
-        biased;
-        result = &mut request => result,
-        signal = tokio::signal::ctrl_c() => {
-            cancel.cancel();
-            let result = request.await;
-            signal.context("无法监听 Ctrl+C")?;
-            result
+    let mut input_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                println!("\n[Cancel] 收到 Ctrl+C，正在取消当前 Turn。");
+                cancel.cancel();
+                let result = request.await;
+                signal.context("无法监听 Ctrl+C")?;
+                return result;
+            }
+            result = &mut request => return result,
+            line = input_lines.recv(), if input_open => {
+                match line {
+                    Some(Ok(line)) if line.trim() == "/cancel" => {
+                        println!("[Cancel] 收到 /cancel，正在取消当前 Turn。");
+                        cancel.cancel();
+                        return request.await;
+                    }
+                    // 正常输入排队到下一轮，保持管道批量输入的顺序。
+                    Some(Ok(line)) => queued.push_back(line),
+                    Some(Err(error)) => {
+                        cancel.cancel();
+                        let _ = request.await;
+                        return Err(error.into());
+                    }
+                    // 输入 EOF 不是取消：等待当前回答后处理已排队的行。
+                    None => input_open = false,
+                }
+            }
         }
     }
 }
