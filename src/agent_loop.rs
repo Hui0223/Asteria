@@ -31,6 +31,7 @@ pub struct TurnReport {
     pub latest_context_tokens: usize,
     pub context_truncated: bool,
     pub usage: TokenUsage,
+    pub retries: usize,
 }
 
 /// 控制单个 Turn 最多允许多少次“模型思考 → 工具处理”的 Step。
@@ -72,6 +73,7 @@ pub struct AgentLoop<P> {
     last_turn: Option<TurnReport>,
     context_builder: ContextBuilder<HeuristicTokenEstimator>,
     session_usage: TokenUsage,
+    retry_policy: crate::retry::RetryPolicy,
 }
 
 impl<P: ModelProvider> AgentLoop<P> {
@@ -93,12 +95,20 @@ impl<P: ModelProvider> AgentLoop<P> {
             last_turn: None,
             context_builder: ContextBuilder::new(context_policy, HeuristicTokenEstimator),
             session_usage: TokenUsage::default(),
+            retry_policy: crate::retry::RetryPolicy::default(),
         }
     }
 
     /// 返回底层供应商实际使用的模型名称。
     pub fn model(&self) -> &str {
         self.provider.model()
+    }
+
+    /// 设置请求重试策略，拒绝没有首次尝试的配置。
+    pub fn set_retry_policy(&mut self, policy: crate::retry::RetryPolicy) -> Result<()> {
+        anyhow::ensure!(policy.max_attempts > 0, "max_attempts 必须大于零");
+        self.retry_policy = policy;
+        Ok(())
     }
 
     /// 返回最近一个 Turn 的执行报告，便于观测和测试状态变化。
@@ -143,6 +153,7 @@ impl<P: ModelProvider> AgentLoop<P> {
             latest_context_tokens: 0,
             context_truncated: false,
             usage: TokenUsage::default(),
+            retries: 0,
         });
     }
 
@@ -162,10 +173,39 @@ impl<P: ModelProvider> AgentLoop<P> {
             let tool_schema = tools::schema();
             let prepared = self.context_builder.prepare(context, &tool_schema)?;
             self.record_prepared_context(prepared.estimated_tokens(), prepared.truncated());
-            let message = self.provider.complete(&prepared, tool_schema)?;
+            let mut attempt = 1;
+            let message = loop {
+                self.ensure_not_cancelled(cancel)?;
+                match self.provider.complete(&prepared, tool_schema.clone()) {
+                    Ok(message) => break message,
+                    Err(error) => {
+                        self.ensure_not_cancelled(cancel)?;
+                        if attempt >= self.retry_policy.max_attempts
+                            || !crate::retry::is_retryable(&error)
+                        {
+                            return Err(error);
+                        }
+                        let delay = self.retry_policy.delay(attempt);
+                        if let Some(turn) = &mut self.last_turn {
+                            turn.retries += 1;
+                        }
+                        eprintln!(
+                            "[Retry] attempt={}/{} delay={}ms",
+                            attempt + 1,
+                            self.retry_policy.max_attempts,
+                            delay.as_millis()
+                        );
+                        if !crate::retry::wait(delay, cancel) {
+                            self.ensure_not_cancelled(cancel)?;
+                        }
+                        attempt += 1;
+                    }
+                }
+            };
             if let Some(usage) = &message.usage {
                 self.record_usage(usage);
             }
+            self.ensure_not_cancelled(cancel)?;
             let calls = message.tool_calls;
             context.append_assistant(message.content.clone(), calls.clone())?;
 
@@ -428,5 +468,62 @@ mod tests {
             .unwrap();
         assert_eq!(agent_loop.last_turn().unwrap().usage.total_tokens, 23);
         assert_eq!(agent_loop.session_usage().total_tokens, 35);
+    }
+
+    /// 模拟前两次连接失败，第三次成功或继续失败的模型。
+    struct FlakyProvider {
+        calls: std::cell::Cell<usize>,
+        succeed: bool,
+    }
+    impl ModelProvider for FlakyProvider {
+        /// 返回测试模型名称。
+        fn model(&self) -> &str {
+            "flaky"
+        }
+        /// 返回可重试连接错误或带用量的答案。
+        fn complete(&self, _: &PreparedContext, _: Value) -> Result<AssistantTurn> {
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() < 3 || !self.succeed {
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into());
+            }
+            let mut result = answer("done");
+            result.usage = Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+            });
+            Ok(result)
+        }
+    }
+
+    #[test]
+    /// 重试不增加 Step，不重复写消息，用量只累计一次；耗尽后回滚。
+    fn retries_preserve_step_context_and_usage() {
+        for succeed in [true, false] {
+            let mut engine = AgentLoop::new(
+                FlakyProvider {
+                    calls: std::cell::Cell::new(0),
+                    succeed,
+                },
+                LoopConfig::default(),
+            );
+            engine
+                .set_retry_policy(crate::retry::RetryPolicy {
+                    base_delay: std::time::Duration::ZERO,
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut memory = ContextMemory::new("system");
+            let result = engine.run_turn(&mut memory, "hi", &CancelToken::default());
+            assert_eq!(result.is_ok(), succeed);
+            assert_eq!(engine.provider.calls.get(), 3);
+            assert_eq!(engine.last_turn().unwrap().steps, 1);
+            assert_eq!(engine.last_turn().unwrap().retries, 2);
+            assert_eq!(memory.messages().len(), if succeed { 2 } else { 0 });
+            assert_eq!(
+                engine.session_usage().total_tokens,
+                if succeed { 12 } else { 0 }
+            );
+        }
     }
 }

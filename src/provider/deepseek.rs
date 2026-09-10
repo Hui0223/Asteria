@@ -22,7 +22,11 @@ impl DeepSeekProvider {
     /// 从环境变量创建 DeepSeek 适配器，并使用默认模型作为后备值。
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .context("无法创建 HTTP 客户端")?,
             api_key: env::var("DEEPSEEK_API_KEY").context("请先在 .env 中设置 DEEPSEEK_API_KEY")?,
             model: env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".into()),
         })

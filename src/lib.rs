@@ -6,4 +6,5 @@ pub mod context;
 pub mod context_builder;
 pub mod message;
 pub mod provider;
+pub mod retry;
 pub mod tools;
