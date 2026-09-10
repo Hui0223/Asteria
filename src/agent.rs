@@ -28,6 +28,11 @@ impl Asteria {
         self.agent_loop.model()
     }
 
+    /// 将请求重试提示交给终端统一绘制。
+    pub fn set_retry_output(&mut self, output: impl Fn(String) + Send + Sync + 'static) {
+        self.agent_loop.set_retry_output(output);
+    }
+
     /// 返回最近一个 Turn 的真实 Token 使用量；尚未请求模型时返回 None。
     pub fn last_usage(&self) -> Option<&TokenUsage> {
         self.agent_loop.last_turn().map(|turn| &turn.usage)

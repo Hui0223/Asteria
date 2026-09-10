@@ -12,7 +12,9 @@ cargo run --release
 
 输入 `/context` 查看原始记忆，`/usage` 查看最近 Turn 与会话累计用量，`/reset` 清空记忆（保留用量统计），`/exit` 退出。
 
-等待回答期间仍可输入：终端会显示“你（可继续输入…）”，收到普通输入后显示 `[已排队]` 和待处理条数。当前轮结束后，会显示 `[开始处理排队输入]` 及对应内容，再按顺序执行；空行不排队。`/cancel` 立即取消当前轮，其余输入（包括 `/context`、`/usage`、`/reset`、`/exit`）按队列顺序处理。取消当前轮不会清空已排队的输入。
+交互终端由 Reedline 统一绘制 `你: ` 输入行，支持中文宽度、退格、左右移动、跨行和粘贴。回答、排队提示、重试日志出现时，会输出在输入行上方并恢复尚未提交的草稿。输入历史只保存在内存，不自动写历史文件。
+
+等待回答期间仍可输入，收到普通输入后显示 `[已排队]` 和待处理条数。当前轮结束后显示 `[开始处理排队输入]` 及对应内容，再按顺序执行；空行不排队。`/cancel` 立即取消当前轮，其余输入（包括 `/context`、`/usage`、`/reset`、`/exit`）按队列顺序处理。取消当前轮不会清空已排队的输入。管道、重定向或 `TERM=dumb` 使用纯文本模式，不启用光标编辑。
 
 如果内嵌终端没有将 Ctrl+C 传给进程，在等待模型回答期间输入 `/cancel` 并按回车，同样可以取消当前 Turn。程序会打印 `[Cancel] 收到 ...`，随后完成回滚并显示 `Cancelled`。这提供了不依赖快捷键的取消入口，并不表示终端的按键传递问题已修复。
 
@@ -35,6 +37,7 @@ API Key 只保存在本地 `.env` 中，请勿提交。
 - `src/message.rs`：内部消息模型
 - `src/tools.rs`：工具定义与执行
 - `src/main.rs`：命令行交互
+- `src/terminal.rs`：中文行编辑、统一后台输出、终端退出恢复
 
 库调用已改为异步：`agent.ask(input).await`、`agent.ask_with_cancel(input, &cancel).await`。
 取消时调用 `cancel.cancel()`，并等待 Turn Future 返回以完成回滚；不要直接丢弃或 abort 整个 Turn Future。
@@ -53,6 +56,19 @@ Loop 测试另行验证退避取消、已返回用量保留和下一轮继续执
 真实服务手动验证：运行 `cargo run`，先让 Agent 记住一个代号；下一轮要求长回答，等待期间按 Ctrl+C；执行 `/context` 确认仅保留取消前的历史；再询问代号，确认仍能正常回答。
 
 本次实际验证：Turn 1 记住 `ORION-731`，报告总用量 350；Turn 2 在真实请求等待时取消，原始历史仍为 2 条，已报告的会话用量保持 350；Turn 3 正确回复 `ORION-731`，会话用量变为 719。另一次进程使用不可用的本地代理，在 500ms 退避中按 Ctrl+C，得到 `Cancelled` 且消息数为 0。
+
+## 终端编辑回归测试
+
+在 Python 测试环境中安装 `tests/requirements-terminal.txt`，然后执行：
+
+```bash
+cargo build
+python3 tests/terminal_editing.py
+# 额外验证真实 DeepSeek 回答和取消，会产生 API 用量
+python3 tests/terminal_editing.py --live
+```
+
+脚本使用真实 PTY 启动当前二进制，并通过 pyte 解析 ANSI 屏幕，断言输入行没有中文残影。覆盖 80/24 列显示、中文标点删除、组合字符、光标移动、跨行删除、粘贴、重试输出期间编辑、Ctrl+C 及 `/exit` 后恢复终端模式。
 
 ## 回滚
 

@@ -13,3 +13,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+reedline = { version = "0.51", default-features = false, features = ["external_printer"] }

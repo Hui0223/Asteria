@@ -56,6 +56,7 @@ pub struct AgentLoop<P> {
     context_builder: ContextBuilder<HeuristicTokenEstimator>,
     session_usage: TokenUsage,
     retry_policy: crate::retry::RetryPolicy,
+    retry_output: Option<Box<dyn Fn(String) + Send + Sync>>,
 }
 
 impl<P: ModelProvider> AgentLoop<P> {
@@ -78,12 +79,18 @@ impl<P: ModelProvider> AgentLoop<P> {
             context_builder: ContextBuilder::new(context_policy, HeuristicTokenEstimator),
             session_usage: TokenUsage::default(),
             retry_policy: crate::retry::RetryPolicy::default(),
+            retry_output: None,
         }
     }
 
     /// 返回底层供应商实际使用的模型名称。
     pub fn model(&self) -> &str {
         self.provider.model()
+    }
+
+    /// 注入重试信息的输出入口，使 CLI 能在重绘输入行时安全显示日志。
+    pub fn set_retry_output(&mut self, output: impl Fn(String) + Send + Sync + 'static) {
+        self.retry_output = Some(Box::new(output));
     }
 
     /// 设置请求重试策略，拒绝没有首次尝试的配置。
@@ -181,12 +188,17 @@ impl<P: ModelProvider> AgentLoop<P> {
                         if let Some(turn) = &mut self.last_turn {
                             turn.retries += 1;
                         }
-                        eprintln!(
+                        let notice = format!(
                             "[Retry] attempt={}/{} delay={}ms",
                             attempt + 1,
                             self.retry_policy.max_attempts,
                             delay.as_millis()
                         );
+                        if let Some(output) = &self.retry_output {
+                            output(notice);
+                        } else {
+                            eprintln!("{notice}");
+                        }
                         if !crate::retry::wait(delay, cancel).await {
                             self.ensure_not_cancelled(cancel)?;
                         }
