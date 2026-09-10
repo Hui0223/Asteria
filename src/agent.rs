@@ -1,5 +1,5 @@
 use crate::{
-    agent_loop::{AgentLoop, CancelToken, LoopConfig},
+    agent_loop::{AgentLoop, CancelToken, LoopConfig, TurnReport},
     context::ContextMemory,
     provider::TokenUsage,
     provider::deepseek::DeepSeekProvider,
@@ -36,6 +36,16 @@ impl Asteria {
     /// 返回当前进程内所有 Turn 的累计 Token 使用量。
     pub fn session_usage(&self) -> &TokenUsage {
         self.agent_loop.session_usage()
+    }
+
+    /// 读取最近一轮报告，包括失败、取消和重试信息。
+    pub fn last_turn(&self) -> Option<&TurnReport> {
+        self.agent_loop.last_turn()
+    }
+
+    /// 只读访问原始记忆，用于本地诊断；不会发送模型请求。
+    pub fn context(&self) -> &ContextMemory {
+        &self.context
     }
 
     /// 清空对话历史，但保留 Agent 的系统设定。
