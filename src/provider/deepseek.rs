@@ -4,7 +4,7 @@ use crate::{
     provider::{AssistantTurn, ModelProvider, TokenUsage},
 };
 use anyhow::{Context, Result};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::env;
@@ -16,6 +16,7 @@ pub struct DeepSeekProvider {
     client: Client,
     api_key: String,
     model: String,
+    api_url: String,
 }
 
 impl DeepSeekProvider {
@@ -29,14 +30,15 @@ impl DeepSeekProvider {
                 .context("无法创建 HTTP 客户端")?,
             api_key: env::var("DEEPSEEK_API_KEY").context("请先在 .env 中设置 DEEPSEEK_API_KEY")?,
             model: env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".into()),
+            api_url: API_URL.into(),
         })
     }
 
     /// 执行一次 DeepSeek HTTP 请求并解析为统一助手消息。
-    fn request(&self, context: &PreparedContext, tools: Value) -> Result<AssistantTurn> {
+    async fn request(&self, context: &PreparedContext, tools: Value) -> Result<AssistantTurn> {
         let response: ChatResponse = self
             .client
-            .post(API_URL)
+            .post(&self.api_url)
             .bearer_auth(&self.api_key)
             .json(&json!({
                 "model": self.model,
@@ -46,10 +48,12 @@ impl DeepSeekProvider {
                 "thinking": {"type": "disabled"}
             }))
             .send()
+            .await
             .context("无法连接 DeepSeek API")?
             .error_for_status()
             .context("DeepSeek API 返回错误")?
             .json()
+            .await
             .context("无法解析 DeepSeek 响应")?;
 
         let message = response
@@ -85,8 +89,8 @@ impl ModelProvider for DeepSeekProvider {
     }
 
     /// 把中立上下文转换成 DeepSeek 协议并完成一个模型 Step。
-    fn complete(&self, context: &PreparedContext, tools: Value) -> Result<AssistantTurn> {
-        self.request(context, tools)
+    async fn complete(&self, context: &PreparedContext, tools: Value) -> Result<AssistantTurn> {
+        self.request(context, tools).await
     }
 }
 
@@ -248,5 +252,82 @@ mod tests {
                 .unwrap()
                 .contains("历史摘要")
         );
+    }
+
+    /// 用真实 TCP 连接让服务停在响应头或正文读取阶段，再取消 Agent。
+    async fn check_http_cancellation(partial_body: bool) {
+        use crate::agent_loop::{AgentLoop, CancelToken, LoopConfig, TurnState};
+        use std::time::Duration;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut data = Vec::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&buffer[..count]);
+                if data.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if partial_body {
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n{\"choices\": [").await.unwrap();
+            }
+            ready.send(()).unwrap();
+            // 保持连接打开，直到测试取消服务任务，客户端不能靠 EOF 提前返回。
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let provider = DeepSeekProvider {
+            client: Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .unwrap(),
+            api_key: "test-only".into(),
+            model: "test".into(),
+            api_url,
+        };
+        let mut engine = AgentLoop::new(provider, LoopConfig::default());
+        let mut memory = ContextMemory::new("system");
+        let cancel = CancelToken::new();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(engine.run_turn(&mut memory, "hi", &cancel), async {
+                started.await.unwrap();
+                // 给 reqwest 机会进入正文读取，而不是只停留在连接阶段。
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                cancel.cancel();
+            })
+            .0
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert!(outcome.expect("取消不能等到 120 秒请求超时").is_err());
+        let report = engine.last_turn().unwrap();
+        assert_eq!(report.state, TurnState::Cancelled);
+        assert_eq!(report.retries, 0);
+        assert_eq!(report.usage.total_tokens, 0);
+        assert!(memory.messages().is_empty());
+    }
+
+    #[tokio::test]
+    /// 实际 HTTP 连接等待响应头时可取消。
+    async fn cancels_http_before_headers() {
+        check_http_cancellation(false).await;
+    }
+
+    #[tokio::test]
+    /// 已收到响应头，但 JSON 正文尚未读完时也可取消。
+    async fn cancels_http_during_body() {
+        check_http_cancellation(true).await;
     }
 }

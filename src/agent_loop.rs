@@ -5,10 +5,8 @@ use crate::{
     tools,
 };
 use anyhow::{Result, bail};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+/// 可克隆的异步取消信号，取消后唤醒所有 cancelled() 等待者。
+pub use tokio_util::sync::CancellationToken as CancelToken;
 
 /// 一个用户 Turn 在 Agent Loop 中可能处于的状态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,22 +44,6 @@ impl Default for LoopConfig {
         Self {
             max_steps_per_turn: 8,
         }
-    }
-}
-
-/// 可在线程之间共享的协作式取消信号。
-#[derive(Clone, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
-
-impl CancelToken {
-    /// 发出取消请求；Loop 会在下一个模型或工具边界停止。
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    /// 检查调用方是否已经发出取消请求。
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -121,8 +103,8 @@ impl<P: ModelProvider> AgentLoop<P> {
         &self.session_usage
     }
 
-    /// 执行一个完整用户 Turn；失败或取消时自动回滚本 Turn 的上下文。
-    pub fn run_turn(
+    /// 异步执行 Turn；取消请发信号并等待本方法结束，以完成回滚，勿直接丢弃此 Future。
+    pub async fn run_turn(
         &mut self,
         context: &mut ContextMemory,
         input: &str,
@@ -130,7 +112,7 @@ impl<P: ModelProvider> AgentLoop<P> {
     ) -> Result<String> {
         let checkpoint = context.checkpoint();
         self.begin_turn();
-        let result = self.run_steps(context, input, cancel);
+        let result = self.run_steps(context, input, cancel).await;
         if result.is_err() {
             context.rollback(checkpoint);
             if self.current_state() != TurnState::Cancelled {
@@ -158,7 +140,7 @@ impl<P: ModelProvider> AgentLoop<P> {
     }
 
     /// 逐 Step 请求模型、执行工具，直到得到最终答案或达到上限。
-    fn run_steps(
+    async fn run_steps(
         &mut self,
         context: &mut ContextMemory,
         input: &str,
@@ -176,7 +158,17 @@ impl<P: ModelProvider> AgentLoop<P> {
             let mut attempt = 1;
             let message = loop {
                 self.ensure_not_cancelled(cancel)?;
-                match self.provider.complete(&prepared, tool_schema.clone()) {
+                // 优先接收已就绪的响应以记录 usage，然后再检查取消。
+                let response = tokio::select! {
+                    biased;
+                    result = self.provider.complete(&prepared, tool_schema.clone()) => Some(result),
+                    _ = cancel.cancelled() => None,
+                };
+                let Some(response) = response else {
+                    self.transition(TurnState::Cancelled);
+                    bail!("当前 Turn 已取消");
+                };
+                match response {
                     Ok(message) => break message,
                     Err(error) => {
                         self.ensure_not_cancelled(cancel)?;
@@ -195,7 +187,7 @@ impl<P: ModelProvider> AgentLoop<P> {
                             self.retry_policy.max_attempts,
                             delay.as_millis()
                         );
-                        if !crate::retry::wait(delay, cancel) {
+                        if !crate::retry::wait(delay, cancel).await {
                             self.ensure_not_cancelled(cancel)?;
                         }
                         attempt += 1;
@@ -317,7 +309,11 @@ mod tests {
         }
 
         /// 弹出下一个预设响应，模拟模型完成一个 Step。
-        fn complete(&self, _context: &PreparedContext, _tools: Value) -> Result<AssistantTurn> {
+        async fn complete(
+            &self,
+            _context: &PreparedContext,
+            _tools: Value,
+        ) -> Result<AssistantTurn> {
             self.responses
                 .borrow_mut()
                 .pop_front()
@@ -347,9 +343,9 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     /// 验证无需工具的 Turn 只包含一个 Step 并正常完成。
-    fn completes_plain_turn_in_one_step() {
+    async fn completes_plain_turn_in_one_step() {
         let provider = FakeProvider::new(vec![answer("hello")]);
         let mut agent_loop = AgentLoop::new(provider, LoopConfig::default());
         let mut context = ContextMemory::new("system");
@@ -357,6 +353,7 @@ mod tests {
         assert_eq!(
             agent_loop
                 .run_turn(&mut context, "hi", &CancelToken::default())
+                .await
                 .unwrap(),
             "hello"
         );
@@ -365,15 +362,16 @@ mod tests {
         assert_eq!(report.state, TurnState::Completed);
     }
 
-    #[test]
+    #[tokio::test]
     /// 验证一次工具调用会产生两个 Step 和完整状态轨迹。
-    fn executes_tool_between_two_steps() {
+    async fn executes_tool_between_two_steps() {
         let provider = FakeProvider::new(vec![calculate_call("a"), answer("2")]);
         let mut agent_loop = AgentLoop::new(provider, LoopConfig::default());
         let mut context = ContextMemory::new("system");
 
         agent_loop
             .run_turn(&mut context, "1+1", &CancelToken::default())
+            .await
             .unwrap();
         let report = agent_loop.last_turn().unwrap();
         assert_eq!(report.steps, 2);
@@ -388,9 +386,9 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     /// 验证超过 Step 上限会失败，并回滚该 Turn 写入的全部消息。
-    fn rolls_back_when_step_limit_is_reached() {
+    async fn rolls_back_when_step_limit_is_reached() {
         let provider = FakeProvider::new(vec![calculate_call("a")]);
         let mut agent_loop = AgentLoop::new(
             provider,
@@ -403,46 +401,54 @@ mod tests {
         assert!(
             agent_loop
                 .run_turn(&mut context, "keep calling", &CancelToken::default())
+                .await
                 .is_err()
         );
         assert!(context.messages().is_empty());
         assert_eq!(agent_loop.last_turn().unwrap().state, TurnState::Failed);
     }
 
-    #[test]
+    #[tokio::test]
     /// 验证取消的 Turn 不污染上下文，并留下 Cancelled 状态。
-    fn cancellation_rolls_back_turn() {
+    async fn cancellation_rolls_back_turn() {
         let provider = FakeProvider::new(vec![answer("unused")]);
         let mut agent_loop = AgentLoop::new(provider, LoopConfig::default());
         let mut context = ContextMemory::new("system");
         let cancel = CancelToken::default();
         cancel.cancel();
 
-        assert!(agent_loop.run_turn(&mut context, "hi", &cancel).is_err());
+        assert!(
+            agent_loop
+                .run_turn(&mut context, "hi", &cancel)
+                .await
+                .is_err()
+        );
         assert!(context.messages().is_empty());
         assert_eq!(agent_loop.last_turn().unwrap().state, TurnState::Cancelled);
     }
 
-    #[test]
+    #[tokio::test]
     /// 验证每个新 Turn 都会获得不同且递增的 ID。
-    fn assigns_unique_turn_ids() {
+    async fn assigns_unique_turn_ids() {
         let provider = FakeProvider::new(vec![answer("one"), answer("two")]);
         let mut agent_loop = AgentLoop::new(provider, LoopConfig::default());
         let mut context = ContextMemory::new("system");
 
         agent_loop
             .run_turn(&mut context, "first", &CancelToken::default())
+            .await
             .unwrap();
         let first_id = agent_loop.last_turn().unwrap().id;
         agent_loop
             .run_turn(&mut context, "second", &CancelToken::default())
+            .await
             .unwrap();
         assert_eq!(agent_loop.last_turn().unwrap().id, first_id + 1);
     }
 
-    #[test]
+    #[tokio::test]
     /// 验证每个 Step 的 usage 同时累计到 Turn 和整个 Session。
-    fn accumulates_session_usage_across_turns() {
+    async fn accumulates_session_usage_across_turns() {
         let mut first = answer("one");
         first.usage = Some(TokenUsage {
             prompt_tokens: 10,
@@ -461,10 +467,12 @@ mod tests {
 
         agent_loop
             .run_turn(&mut context, "first", &CancelToken::default())
+            .await
             .unwrap();
         assert_eq!(agent_loop.last_turn().unwrap().usage.total_tokens, 12);
         agent_loop
             .run_turn(&mut context, "second", &CancelToken::default())
+            .await
             .unwrap();
         assert_eq!(agent_loop.last_turn().unwrap().usage.total_tokens, 23);
         assert_eq!(agent_loop.session_usage().total_tokens, 35);
@@ -481,7 +489,7 @@ mod tests {
             "flaky"
         }
         /// 返回可重试连接错误或带用量的答案。
-        fn complete(&self, _: &PreparedContext, _: Value) -> Result<AssistantTurn> {
+        async fn complete(&self, _: &PreparedContext, _: Value) -> Result<AssistantTurn> {
             self.calls.set(self.calls.get() + 1);
             if self.calls.get() < 3 || !self.succeed {
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into());
@@ -496,9 +504,9 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     /// 重试不增加 Step，不重复写消息，用量只累计一次；耗尽后回滚。
-    fn retries_preserve_step_context_and_usage() {
+    async fn retries_preserve_step_context_and_usage() {
         for succeed in [true, false] {
             let mut engine = AgentLoop::new(
                 FlakyProvider {
@@ -514,7 +522,9 @@ mod tests {
                 })
                 .unwrap();
             let mut memory = ContextMemory::new("system");
-            let result = engine.run_turn(&mut memory, "hi", &CancelToken::default());
+            let result = engine
+                .run_turn(&mut memory, "hi", &CancelToken::default())
+                .await;
             assert_eq!(result.is_ok(), succeed);
             assert_eq!(engine.provider.calls.get(), 3);
             assert_eq!(engine.last_turn().unwrap().steps, 1);
@@ -525,5 +535,140 @@ mod tests {
                 if succeed { 12 } else { 0 }
             );
         }
+    }
+
+    /// 第一 Step 完成工具调用；第二 Step 挂起或失败，后续新 Turn 正常回答。
+    struct InterruptibleProvider {
+        calls: std::cell::Cell<usize>,
+        waiting: std::sync::Arc<tokio::sync::Notify>,
+        retry: bool,
+    }
+
+    impl ModelProvider for InterruptibleProvider {
+        /// 返回取消测试使用的模型名。
+        fn model(&self) -> &str {
+            "interruptible"
+        }
+
+        /// 用通知精确标记进入请求或退避的位置，避免测试依赖网络速度。
+        async fn complete(&self, _: &PreparedContext, _: Value) -> Result<AssistantTurn> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if call == 1 {
+                let mut response = calculate_call("completed-tool");
+                response.usage = Some(TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 2,
+                    total_tokens: 12,
+                });
+                return Ok(response);
+            }
+            if call == 2 {
+                self.waiting.notify_one();
+                if self.retry {
+                    return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into());
+                }
+                return std::future::pending().await;
+            }
+            Ok(answer("下一轮正常"))
+        }
+    }
+
+    /// 验证取消后回滚完整本轮、保留已有用量、不会重试被取消的请求且下一轮正常。
+    async fn check_interrupt(retry: bool) {
+        let waiting = std::sync::Arc::new(tokio::sync::Notify::new());
+        let provider = InterruptibleProvider {
+            calls: std::cell::Cell::new(0),
+            waiting: waiting.clone(),
+            retry,
+        };
+        let mut engine = AgentLoop::new(provider, LoopConfig::default());
+        engine
+            .set_retry_policy(crate::retry::RetryPolicy {
+                base_delay: std::time::Duration::from_secs(8),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut memory = ContextMemory::new("system");
+        memory.append_user("旧问题").unwrap();
+        memory
+            .append_assistant(Some("旧回答".into()), vec![])
+            .unwrap();
+        let original = memory.messages().to_vec();
+        let cancel = CancelToken::new();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let (result, ()) = tokio::join!(engine.run_turn(&mut memory, "计算", &cancel), async {
+                waiting.notified().await;
+                cancel.cancel();
+            });
+            result
+        })
+        .await
+        .expect("取消必须立即唤醒请求/退避");
+        assert!(result.is_err());
+        let report = engine.last_turn().unwrap();
+        assert_eq!(report.state, TurnState::Cancelled);
+        assert_eq!(report.steps, 2);
+        assert_eq!(report.retries, usize::from(retry));
+        assert_eq!(report.usage.total_tokens, 12);
+        assert_eq!(engine.session_usage().total_tokens, 12);
+        assert_eq!(engine.provider.calls.get(), 2);
+        assert_eq!(memory.messages(), original);
+        let next = engine
+            .run_turn(&mut memory, "继续", &CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(next, "下一轮正常");
+        assert_eq!(engine.last_turn().unwrap().state, TurnState::Completed);
+        assert_eq!(engine.last_turn().unwrap().id, 2);
+        assert_eq!(engine.session_usage().total_tokens, 12);
+        assert_eq!(memory.messages().len(), original.len() + 2);
+    }
+
+    #[tokio::test]
+    /// 正在等待模型时取消，完成回滚后可继续下一轮。
+    async fn cancels_pending_request_and_resumes() {
+        check_interrupt(false).await;
+    }
+
+    #[tokio::test]
+    /// 在 8 秒退避中取消，不等待完整退避，也不会再发一次请求。
+    async fn cancels_backoff_and_resumes() {
+        check_interrupt(true).await;
+    }
+
+    /// 在响应就绪的同一时刻发送取消信号。
+    struct ReadyCancelledProvider(CancelToken);
+    impl ModelProvider for ReadyCancelledProvider {
+        /// 返回竞态测试模型名称。
+        fn model(&self) -> &str {
+            "ready-cancelled"
+        }
+        /// 返回带 usage 的响应，同时触发取消。
+        async fn complete(&self, _: &PreparedContext, _: Value) -> Result<AssistantTurn> {
+            self.0.cancel();
+            let mut response = answer("不应写入历史");
+            response.usage = Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+            });
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    /// 已收到响应的 usage 在取消时仍保留，但正文不写入上下文。
+    async fn cancellation_keeps_ready_response_usage() {
+        let cancel = CancelToken::new();
+        let mut engine = AgentLoop::new(
+            ReadyCancelledProvider(cancel.clone()),
+            LoopConfig::default(),
+        );
+        let mut memory = ContextMemory::new("system");
+        assert!(engine.run_turn(&mut memory, "hi", &cancel).await.is_err());
+        assert_eq!(engine.last_turn().unwrap().state, TurnState::Cancelled);
+        assert_eq!(engine.session_usage().total_tokens, 12);
+        assert!(memory.messages().is_empty());
     }
 }

@@ -54,12 +54,14 @@ impl Asteria {
     }
 
     /// 使用一个新的取消令牌执行完整用户 Turn。
-    pub fn ask(&mut self, input: &str) -> Result<String> {
-        self.ask_with_cancel(input, &CancelToken::default())
+    pub async fn ask(&mut self, input: &str) -> Result<String> {
+        self.ask_with_cancel(input, &CancelToken::default()).await
     }
 
     /// 使用调用方提供的令牌执行 Turn，以支持协作式取消。
-    pub fn ask_with_cancel(&mut self, input: &str, cancel: &CancelToken) -> Result<String> {
-        self.agent_loop.run_turn(&mut self.context, input, cancel)
+    pub async fn ask_with_cancel(&mut self, input: &str, cancel: &CancelToken) -> Result<String> {
+        self.agent_loop
+            .run_turn(&mut self.context, input, cancel)
+            .await
     }
 }

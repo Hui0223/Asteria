@@ -8,7 +8,8 @@ anyhow = "1"
 chrono = "0.4"
 dotenvy = "0.15"
 meval = "0.2"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }

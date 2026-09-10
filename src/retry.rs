@@ -1,8 +1,5 @@
 use crate::agent_loop::CancelToken;
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
+use std::time::Duration;
 
 /// 单个 Step 的请求尝试策略；次数包含第一次请求。
 #[derive(Clone, Copy, Debug)]
@@ -56,18 +53,12 @@ pub fn is_retryable(error: &anyhow::Error) -> bool {
         })
 }
 
-/// 每 25ms 检查取消信号；返回 false 表示等待被取消。
-pub fn wait(delay: Duration, cancel: &CancelToken) -> bool {
-    let start = Instant::now();
-    loop {
-        if cancel.is_cancelled() {
-            return false;
-        }
-        let remaining = delay.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            return true;
-        }
-        thread::sleep(remaining.min(Duration::from_millis(25)));
+/// 异步等待退避或取消信号；不占用线程，取消时返回 false。
+pub async fn wait(delay: Duration, cancel: &CancelToken) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
     }
 }
 
@@ -82,12 +73,12 @@ mod tests {
         assert_eq!(p.delay(2), Duration::from_secs(1));
         assert_eq!(p.delay(100), Duration::from_secs(8));
     }
-    #[test]
+    #[tokio::test]
     /// 取消信号使长等待立即退出。
-    fn cancelled_wait_returns() {
+    async fn cancelled_wait_returns() {
         let c = CancelToken::default();
         c.cancel();
-        assert!(!wait(Duration::from_secs(8), &c));
+        assert!(!wait(Duration::from_secs(8), &c).await);
     }
     #[test]
     /// 临时连接中断可重试，普通协议错误不可重试。

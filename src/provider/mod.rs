@@ -25,6 +25,10 @@ pub trait ModelProvider {
     /// 返回当前供应商实际使用的模型名称。
     fn model(&self) -> &str;
 
-    /// 根据预算化上下文和工具定义生成下一个助手消息。
-    fn complete(&self, context: &PreparedContext, tools: Value) -> Result<AssistantTurn>;
+    /// 异步生成助手消息；取消时会丢弃该 Future，实现方不得在后台继续写上下文。
+    fn complete(
+        &self,
+        context: &PreparedContext,
+        tools: Value,
+    ) -> impl std::future::Future<Output = Result<AssistantTurn>>;
 }

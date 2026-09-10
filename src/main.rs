@@ -1,22 +1,35 @@
-use anyhow::Result;
-use asteria_agent::agent::Asteria;
+use anyhow::{Context, Result};
+use asteria_agent::{
+    agent::Asteria,
+    agent_loop::{CancelToken, TurnState},
+};
 use std::io::{self, Write};
+use tokio::sync::mpsc;
 
 /// 启动命令行 Agent，并持续读取用户输入直到退出。
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let mut agent = Asteria::new()?;
     println!(
-        "Asteria · {}  (/context 查看记忆，/usage 查看统计，/reset 清空记忆，/exit 退出)",
+        "Asteria · {}  (/context 查看记忆，/usage 查看统计，/reset 清空记忆，/exit 退出；运行中 Ctrl+C 取消当前轮)",
         agent.model()
     );
+    let mut input_lines = read_input()?;
     loop {
         print!("\n你: ");
         io::stdout().flush()?;
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input)? == 0 {
-            break;
-        }
+        let input = tokio::select! {
+            line = input_lines.recv() => match line {
+                Some(line) => line?,
+                None => break,
+            },
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("无法监听 Ctrl+C")?;
+                println!("\n当前没有运行中的 Turn，输入 /exit 退出。");
+                continue;
+            }
+        };
         match input.trim() {
             "/exit" => break,
             "/context" => print_context(&agent),
@@ -27,8 +40,15 @@ fn main() -> Result<()> {
             }
             "" => {}
             text => {
-                match agent.ask(text) {
+                match ask_interruptible(&mut agent, text).await {
                     Ok(answer) => println!("Asteria: {answer}"),
+                    Err(_)
+                        if agent
+                            .last_turn()
+                            .is_some_and(|turn| turn.state == TurnState::Cancelled) =>
+                    {
+                        println!("Asteria: 当前 Turn 已取消，可继续提问。");
+                    }
                     Err(error) => println!("错误: {error:#}"),
                 }
                 print_usage(&agent);
@@ -36,6 +56,51 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 用独立输入线程读取终端，通过有界通道交给异步主循环。
+/// 不使用 Tokio 的阻塞 stdin 任务，避免 /exit 时运行时等待 stdin 关闭。
+fn read_input() -> Result<mpsc::Receiver<io::Result<String>>> {
+    let (sender, receiver) = mpsc::channel(16);
+    std::thread::Builder::new()
+        .name("asteria-stdin".into())
+        .spawn(move || {
+            loop {
+                let mut line = String::new();
+                match io::stdin().read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if sender.blocking_send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        let _ = sender.blocking_send(Err(error));
+                        break;
+                    }
+                }
+            }
+        })
+        .context("无法创建终端输入线程")?;
+    Ok(receiver)
+}
+
+/// 同时等待回答和 Ctrl+C；只取消请求信号，继续等待 Turn 完成状态更新与回滚。
+async fn ask_interruptible(agent: &mut Asteria, input: &str) -> Result<String> {
+    let cancel = CancelToken::new();
+    let request = agent.ask_with_cancel(input, &cancel);
+    tokio::pin!(request);
+    tokio::select! {
+        biased;
+        result = &mut request => result,
+        signal = tokio::signal::ctrl_c() => {
+            cancel.cancel();
+            let result = request.await;
+            signal.context("无法监听 Ctrl+C")?;
+            result
+        }
+    }
 }
 
 /// 显示原始内存消息；Debug 转义控制字符，明确区分它与预算后的请求视图。
