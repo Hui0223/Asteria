@@ -17,13 +17,15 @@ async fn main() -> Result<()> {
         agent.model()
     );
     let mut input_lines = read_input()?;
-    let mut queued = VecDeque::new();
+    let mut queued: VecDeque<String> = VecDeque::new();
     loop {
-        print!("\n你: ");
-        io::stdout().flush()?;
         let input = if let Some(line) = queued.pop_front() {
+            // Debug 格式转义控制字符，避免排队内容改变终端显示。
+            println!("\n[开始处理排队输入] {:?}", line.trim());
             line
         } else {
+            print!("\n你: ");
+            io::stdout().flush()?;
             tokio::select! {
                 line = input_lines.recv() => match line {
                     Some(line) => line?,
@@ -100,6 +102,8 @@ async fn ask_interruptible(
     input_lines: &mut mpsc::Receiver<io::Result<String>>,
     queued: &mut VecDeque<String>,
 ) -> Result<String> {
+    println!("Asteria: 正在处理当前问题，后续输入将按顺序执行。");
+    println!("你（可继续输入并回车；输入 /cancel 立即取消当前轮）:");
     let cancel = CancelToken::new();
     let request = agent.ask_with_cancel(input, &cancel);
     tokio::pin!(request);
@@ -122,8 +126,13 @@ async fn ask_interruptible(
                         cancel.cancel();
                         return request.await;
                     }
+                    Some(Ok(line)) if line.trim().is_empty() => {},
                     // 正常输入排队到下一轮，保持管道批量输入的顺序。
-                    Some(Ok(line)) => queued.push_back(line),
+                    Some(Ok(line)) => {
+                        queued.push_back(line);
+                        println!("[已排队] 当前有 {} 条待处理输入，将在当前轮结束后依次处理。", queued.len());
+                        println!("你（可继续输入，或 /cancel 取消当前轮）:");
+                    },
                     Some(Err(error)) => {
                         cancel.cancel();
                         let _ = request.await;
