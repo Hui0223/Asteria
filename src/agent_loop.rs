@@ -57,6 +57,7 @@ pub struct AgentLoop<P> {
     session_usage: TokenUsage,
     retry_policy: crate::retry::RetryPolicy,
     retry_output: Option<Box<dyn Fn(String) + Send + Sync>>,
+    tool_registry: tools::ToolRegistry,
 }
 
 impl<P: ModelProvider> AgentLoop<P> {
@@ -79,6 +80,7 @@ impl<P: ModelProvider> AgentLoop<P> {
             context_builder: ContextBuilder::new(context_policy, HeuristicTokenEstimator),
             session_usage: TokenUsage::default(),
             retry_policy: crate::retry::RetryPolicy::default(),
+            tool_registry: tools::ToolRegistry::default(),
             retry_output: None,
         }
     }
@@ -159,7 +161,7 @@ impl<P: ModelProvider> AgentLoop<P> {
         for _ in 0..self.config.max_steps_per_turn {
             self.ensure_not_cancelled(cancel)?;
             self.increment_steps();
-            let tool_schema = tools::schema();
+            let tool_schema = self.tool_registry.schema();
             let prepared = self.context_builder.prepare(context, &tool_schema)?;
             self.record_prepared_context(prepared.estimated_tokens(), prepared.truncated());
             let mut attempt = 1;
@@ -222,7 +224,7 @@ impl<P: ModelProvider> AgentLoop<P> {
             self.transition(TurnState::WaitingForTools);
             for call in calls {
                 self.ensure_not_cancelled(cancel)?;
-                let output = tools::execute(&call.name, &call.arguments);
+                let output = self.tool_registry.execute(&call.name, &call.arguments);
                 context.append_tool_result(call.id, output.content, output.is_error)?;
             }
             self.transition(TurnState::Running);
