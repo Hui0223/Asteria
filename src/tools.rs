@@ -262,4 +262,37 @@ mod tests {
         assert!(output.content.contains("最多保留 8000 字符"));
         assert!(output.content.starts_with(&"你好".repeat(4000)));
     }
+
+    /// 只用于测试超时：故意等待很久而不返回结果。
+    struct SleepingTool;
+
+    #[async_trait::async_trait]
+    impl AgentTool for SleepingTool {
+        /// 返回测试工具名称。
+        fn name(&self) -> &str {
+            "sleeping"
+        }
+        /// 返回测试工具 Schema。
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"sleeping","parameters":{"type":"object"}}})
+        }
+        /// 等待一段超过测试上限的时间。
+        async fn execute(&self, _: &str) -> ToolOutput {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            ToolOutput {
+                content: "不应到达".into(),
+                is_error: false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    /// 验证工具超时会返回错误结果，而不是拖住 Agent Loop。
+    async fn registry_times_out_slow_tool() {
+        let mut registry = ToolRegistry::with_execution_timeout(Duration::from_millis(5));
+        registry.register(SleepingTool);
+        let output = registry.execute("sleeping", "{}").await;
+        assert!(output.is_error);
+        assert!(output.content.contains("执行超时"));
+    }
 }
