@@ -9,6 +9,13 @@ pub struct ToolOutput {
     pub is_error: bool,
 }
 
+/// 一个并发工具批次的结果，带回原始调用位置以维持消息顺序。
+pub struct ToolExecutionResult {
+    pub index: usize,
+    pub call_id: String,
+    pub output: ToolOutput,
+}
+
 /// 定义一个可被模型发现和调用的工具。
 #[async_trait::async_trait]
 pub trait AgentTool: Send + Sync {
@@ -68,6 +75,28 @@ impl ToolRegistry {
             },
         };
         truncate_output(output, self.max_output_chars)
+    }
+
+    /// 并发执行一批工具，结果按模型返回的调用顺序排序。
+    pub async fn execute_batch(
+        &self,
+        calls: &[crate::message::ToolCall],
+    ) -> Vec<ToolExecutionResult> {
+        use futures::{StreamExt, stream::FuturesUnordered};
+        let pending = FuturesUnordered::new();
+        for (index, call) in calls.iter().enumerate() {
+            let call_id = call.id.clone();
+            pending.push(async move {
+                ToolExecutionResult {
+                    index,
+                    call_id,
+                    output: self.execute(&call.name, &call.arguments).await,
+                }
+            });
+        }
+        let mut results = pending.collect::<Vec<_>>().await;
+        results.sort_by_key(|result| result.index);
+        results
     }
 
     /// 创建带自定义工具结果字符上限的注册中心。
