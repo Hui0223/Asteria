@@ -21,6 +21,7 @@ pub trait AgentTool: Send + Sync {
 /// 保存工具实例，并负责 Schema 汇总和按名称分发。
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn AgentTool>>,
+    max_output_chars: usize,
 }
 
 impl ToolRegistry {
@@ -28,6 +29,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            max_output_chars: 8_000,
         }
     }
 
@@ -43,12 +45,21 @@ impl ToolRegistry {
 
     /// 按模型给出的名称执行工具；未知名称返回结构化错误。
     pub fn execute(&self, name: &str, raw_args: &str) -> ToolOutput {
-        match self.tools.get(name) {
+        let output = match self.tools.get(name) {
             Some(tool) => tool.execute(raw_args),
             None => ToolOutput {
                 content: format!("工具执行失败: 未知工具: {name}"),
                 is_error: true,
             },
+        };
+        truncate_output(output, self.max_output_chars)
+    }
+
+    /// 创建带自定义工具结果字符上限的注册中心。
+    pub fn with_max_output_chars(max_output_chars: usize) -> Self {
+        Self {
+            max_output_chars: max_output_chars.max(1),
+            ..Self::default()
         }
     }
 }
@@ -125,6 +136,18 @@ where
     }
 }
 
+/// 保留 UTF-8 字符边界并给模型明确的截断提示，避免超长结果污染上下文。
+fn truncate_output(mut output: ToolOutput, max_chars: usize) -> ToolOutput {
+    let length = output.content.chars().count();
+    if length > max_chars {
+        output.content = output.content.chars().take(max_chars).collect::<String>();
+        output.content.push_str(&format!(
+            "\n[工具结果已截断：原始 {length} 字符，最多保留 {max_chars} 字符]"
+        ));
+    }
+    output
+}
+
 /// 返回默认注册中心的工具 Schema，保留旧调用入口。
 pub fn schema() -> Value {
     ToolRegistry::default().schema()
@@ -162,5 +185,20 @@ mod tests {
         let output = ToolRegistry::default().execute("calculate", "{}");
         assert!(output.is_error);
         assert!(output.content.contains("缺少 expression"));
+    }
+
+    #[test]
+    /// 验证超长结果按字符截断，不破坏中文 UTF-8，并标明原始长度。
+    fn long_results_are_truncated() {
+        let output = truncate_output(
+            ToolOutput {
+                content: "你好世界".repeat(10),
+                is_error: false,
+            },
+            5,
+        );
+        assert!(output.content.starts_with("你好世界你"));
+        assert!(output.content.contains("工具结果已截断"));
+        assert!(!output.is_error);
     }
 }
