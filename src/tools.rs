@@ -122,6 +122,7 @@ impl Default for ToolRegistry {
         let mut registry = Self::new();
         registry.register(CalculateTool);
         registry.register(CurrentTimeTool);
+        registry.register(WaitForTool);
         registry
     }
 }
@@ -167,6 +168,41 @@ impl AgentTool for CurrentTimeTool {
     /// 忽略空对象以外的字段并返回 RFC3339 本地时间。
     async fn execute(&self, raw_args: &str) -> ToolOutput {
         execute_result(raw_args, |_| Ok(Local::now().to_rfc3339()))
+    }
+}
+
+/// 等待指定秒数的测试工具，用于在 TUI 中验证超时和取消。
+pub struct WaitForTool;
+
+#[async_trait::async_trait]
+impl AgentTool for WaitForTool {
+    /// 返回工具名 wait_for。
+    fn name(&self) -> &str {
+        "wait_for"
+    }
+    /// 返回等待工具的参数 Schema。
+    fn schema(&self) -> Value {
+        json!({"type":"function","function":{"name":"wait_for","description":"等待指定秒数，用于测试工具执行中的取消和超时；不要用于普通任务","parameters":{"type":"object","properties":{"seconds":{"type":"number","description":"等待秒数，范围 1 到 120"}},"required":["seconds"]}}})
+    }
+    /// 在等待期间保持异步挂起，并在完成后返回确认文本。
+    async fn execute(&self, raw_args: &str) -> ToolOutput {
+        let seconds = match serde_json::from_str::<Value>(raw_args)
+            .ok()
+            .and_then(|args| args["seconds"].as_f64())
+        {
+            Some(seconds) if (1.0..=120.0).contains(&seconds) => seconds,
+            _ => {
+                return ToolOutput {
+                    content: "工具执行失败: seconds 必须是 1 到 120 之间的数字".into(),
+                    is_error: true,
+                };
+            }
+        };
+        tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+        ToolOutput {
+            content: format!("已等待 {seconds:.1} 秒"),
+            is_error: false,
+        }
     }
 }
 
@@ -220,9 +256,10 @@ mod tests {
     /// 注册中心 Schema 与默认工具集合保持一致。
     fn default_registry_exposes_builtins() {
         let schema = ToolRegistry::default().schema();
-        assert_eq!(schema.as_array().unwrap().len(), 2);
+        assert_eq!(schema.as_array().unwrap().len(), 3);
         assert!(schema.to_string().contains("calculate"));
         assert!(schema.to_string().contains("current_time"));
+        assert!(schema.to_string().contains("wait_for"));
     }
 
     #[tokio::test]
@@ -323,5 +360,18 @@ mod tests {
         let output = registry.execute("sleeping", "{}").await;
         assert!(output.is_error);
         assert!(output.content.contains("执行超时"));
+    }
+
+    #[tokio::test]
+    /// 验证等待工具参数范围和完成结果。
+    async fn wait_tool_validates_and_completes() {
+        let registry = ToolRegistry::default();
+        let invalid = registry.execute("wait_for", "{\"seconds\":0}").await;
+        assert!(invalid.is_error);
+        let result = registry.execute("wait_for", "{\"seconds\":0.001}").await;
+        assert!(result.is_error);
+        let result = registry.execute("wait_for", "{\"seconds\":1}").await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("已等待"));
     }
 }
