@@ -43,6 +43,28 @@ impl Asteria {
         self.agent_loop.session_usage()
     }
 
+    /// 更新工具的会话权限，不影响已有 Context 和 Token 统计。
+    pub fn set_tool_permission(
+        &mut self,
+        name: &str,
+        permission: crate::permission::ToolPermission,
+    ) -> Result<()> {
+        self.agent_loop.set_tool_permission(name, permission)
+    }
+
+    /// 获取工具权限列表。
+    pub fn tool_permissions(&self) -> Vec<(String, crate::permission::ToolPermission)> {
+        self.agent_loop.tool_permissions()
+    }
+
+    /// 将本次调用的批准请求交给 UI。
+    pub fn set_tool_approver(
+        &mut self,
+        approver: std::sync::Arc<dyn crate::permission::ToolApprover>,
+    ) {
+        self.agent_loop.set_tool_approver(approver);
+    }
+
     /// 读取最近一轮报告，包括失败、取消和重试信息。
     pub fn last_turn(&self) -> Option<&TurnReport> {
         self.agent_loop.last_turn()

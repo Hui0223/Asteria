@@ -105,6 +105,28 @@ impl<P: ModelProvider> AgentLoop<P> {
         Ok(())
     }
 
+    /// 更新当前会话的工具权限，Rust 的可变借用保证不会在批次执行中变更。
+    pub fn set_tool_permission(
+        &mut self,
+        name: &str,
+        permission: crate::permission::ToolPermission,
+    ) -> Result<()> {
+        self.tool_registry.set_permission(name, permission)
+    }
+
+    /// 返回所有注册工具的权限。
+    pub fn tool_permissions(&self) -> Vec<(String, crate::permission::ToolPermission)> {
+        self.tool_registry.permissions()
+    }
+
+    /// 设置工具的异步审批处理器。
+    pub fn set_tool_approver(
+        &mut self,
+        approver: std::sync::Arc<dyn crate::permission::ToolApprover>,
+    ) {
+        self.tool_registry.set_approver(approver);
+    }
+
     /// 返回最近一个 Turn 的执行报告，便于观测和测试状态变化。
     pub fn last_turn(&self) -> Option<&TurnReport> {
         self.last_turn.as_ref()
@@ -717,5 +739,47 @@ mod tests {
         assert_eq!(engine.last_turn().unwrap().state, TurnState::Cancelled);
         assert_eq!(engine.session_usage().total_tokens, 12);
         assert!(memory.messages().is_empty());
+    }
+
+    #[tokio::test]
+    /// 等待批准时取消会回滚本轮，旧审批失效；下一轮仍能正常运行。
+    async fn cancel_pending_approval_and_resume() {
+        use crate::permission::{ChannelApprover, ToolPermission};
+        let mut response = calculate_call("needs-approval");
+        response.usage = Some(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+        });
+        let mut engine = AgentLoop::new(
+            FakeProvider::new(vec![response, answer("继续正常")]),
+            LoopConfig::default(),
+        );
+        engine
+            .set_tool_permission("calculate", ToolPermission::Ask)
+            .unwrap();
+        let (approver, mut requests) = ChannelApprover::channel();
+        engine.set_tool_approver(std::sync::Arc::new(approver));
+        let mut memory = ContextMemory::new("system");
+        let cancel = CancelToken::new();
+        let (result, approval) =
+            tokio::join!(engine.run_turn(&mut memory, "计算", &cancel), async {
+                let approval = requests.recv().await.unwrap();
+                cancel.cancel();
+                approval
+            });
+        assert!(result.is_err());
+        assert_eq!(engine.last_turn().unwrap().state, TurnState::Cancelled);
+        assert!(memory.messages().is_empty());
+        assert_eq!(engine.session_usage().total_tokens, 12);
+        assert!(approval.reply.is_closed());
+        assert!(approval.reply.send(true).is_err());
+        assert_eq!(
+            engine
+                .run_turn(&mut memory, "继续", &CancelToken::new())
+                .await
+                .unwrap(),
+            "继续正常"
+        );
     }
 }

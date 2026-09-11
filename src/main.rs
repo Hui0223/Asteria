@@ -1,9 +1,12 @@
+mod approval_ui;
 mod terminal;
 
 use anyhow::{Context, Result, bail};
+use approval_ui::ApprovalUi;
 use asteria_agent::{
     agent::Asteria,
     agent_loop::{CancelToken, TurnState},
+    permission::ChannelApprover,
 };
 use std::collections::VecDeque;
 use terminal::{InputEvent, Output, Terminal};
@@ -13,6 +16,9 @@ use terminal::{InputEvent, Output, Terminal};
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let mut agent = Asteria::new()?;
+    let (approver, requests) = ChannelApprover::channel();
+    agent.set_tool_approver(std::sync::Arc::new(approver));
+    let mut approvals = ApprovalUi::new(requests);
     let mut terminal = Terminal::start()?;
     let retry_output = terminal.output.clone();
     agent.set_retry_output(move |message| retry_output.print(message));
@@ -20,6 +26,7 @@ async fn main() -> Result<()> {
         "Asteria · {}  (/context 查看记忆，/usage 查看统计，/reset 清空记忆，/exit 退出；Ctrl+C 或 /cancel 取消当前轮)",
         agent.model()
     ));
+    terminal.output.print("工具权限：/permissions 查看；/permission <工具名> allow|deny|ask 设置。待批准时使用 /approve <编号> 或 /deny <编号>。");
     let mut queued: VecDeque<String> = VecDeque::new();
     loop {
         let input = if let Some(line) = queued.pop_front() {
@@ -46,6 +53,12 @@ async fn main() -> Result<()> {
                 }
             }
         };
+        if approvals.respond(&input, &terminal.output) {
+            continue;
+        }
+        if permission_command(&mut agent, &input, &terminal.output) {
+            continue;
+        }
         match input.trim() {
             "/exit" => break,
             "/cancel" => terminal.output.print("当前没有运行中的 Turn。"),
@@ -57,7 +70,15 @@ async fn main() -> Result<()> {
             }
             "" => {}
             text => {
-                match ask_interruptible(&mut agent, text, &mut terminal, &mut queued).await {
+                match ask_interruptible(
+                    &mut agent,
+                    text,
+                    &mut terminal,
+                    &mut queued,
+                    &mut approvals,
+                )
+                .await
+                {
                     Ok(answer) => terminal.output.print(format!("Asteria: {answer}")),
                     Err(_)
                         if agent
@@ -70,6 +91,7 @@ async fn main() -> Result<()> {
                     }
                     Err(error) => terminal.output.print(format!("错误: {error:#}")),
                 }
+                approvals.clear();
                 print_usage(&agent, &terminal.output);
             }
         }
@@ -84,6 +106,7 @@ async fn ask_interruptible(
     input: &str,
     terminal: &mut Terminal,
     queued: &mut VecDeque<String>,
+    approvals: &mut ApprovalUi,
 ) -> Result<String> {
     terminal
         .output
@@ -92,6 +115,7 @@ async fn ask_interruptible(
     let request = agent.ask_with_cancel(input, &cancel);
     tokio::pin!(request);
     let mut input_open = true;
+    let mut approvals_open = true;
     loop {
         tokio::select! {
             biased;
@@ -103,6 +127,12 @@ async fn ask_interruptible(
                 return result;
             }
             result = &mut request => return result,
+            approval = approvals.receiver.recv(), if approvals_open => {
+                match approval {
+                    Some(approval) => approvals.present(approval, &terminal.output, input_open),
+                    None => approvals_open = false,
+                }
+            }
             event = terminal.input.recv(), if input_open => {
                 match event {
                     Some(InputEvent::Cancel) => {
@@ -117,6 +147,7 @@ async fn ask_interruptible(
                     }
                     Some(InputEvent::Line(line)) if line.trim().is_empty() => {},
                     Some(InputEvent::Line(line)) => {
+                        if approvals.respond(&line, &terminal.output) { continue; }
                         queued.push_back(line);
                         terminal.output.print(format!("[已排队] 当前有 {} 条待处理输入，将按顺序执行。", queued.len()));
                     },
@@ -126,11 +157,40 @@ async fn ask_interruptible(
                         bail!("输入错误: {error}");
                     }
                     // EOF 不取消已提交的问题，仍等待答案并处理已排队的消息。
-                    None => input_open = false,
+                    None => { input_open = false; approvals.clear(); },
                 }
             }
         }
     }
+}
+
+/// 只在空闲时更改会话权限；命令错误不会成为模型提示词，也不会默认允许。
+fn permission_command(agent: &mut Asteria, input: &str, output: &Output) -> bool {
+    let parts: Vec<_> = input.split_whitespace().collect();
+    match parts.as_slice() {
+        ["/permissions"] => output.print(
+            agent
+                .tool_permissions()
+                .into_iter()
+                .map(|(name, permission)| format!("{name}: {permission}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        ["/permission", name, value] => {
+            match value
+                .parse()
+                .and_then(|permission| agent.set_tool_permission(name, permission))
+            {
+                Ok(()) => output.print(format!("[权限] {name} = {value}（当前会话；/reset 保留）")),
+                Err(error) => output.print(format!("权限设置失败: {error}")),
+            }
+        }
+        ["/permissions" | "/permission", ..] => {
+            output.print("用法：/permissions 或 /permission <工具名> allow|deny|ask")
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// 显示原始记忆；Debug 转义控制字符，整块输出后由编辑器恢复输入行。

@@ -14,6 +14,31 @@ cargo run --release
 
 用于测试工具取消和超时：输入“请调用 wait_for 工具等待 60 秒”，等待期间输入 `/cancel` 并回车。`wait_for` 是专用测试工具，只等待，不进行系统操作；参数范围为 1～120 秒，工具默认超时为 30 秒。
 
+## 工具权限
+
+当前会话支持 `allow`（直接执行）、`deny`（拒绝执行）和 `ask`（本次调用需批准）。三个内置工具默认 allow；通过 Rust API `register()` 注册的新工具默认 ask，无审批处理器时拒绝执行。明确允许可使用 `register_with_permission(tool, ToolPermission::Allow)`。
+
+```text
+/permissions
+/permission wait_for ask
+请调用 wait_for 等待 5 秒。
+```
+
+出现 `[待批准 #1]` 后查看工具名称和完整参数，再输入 `/approve 1` 或 `/deny 1`。编号以实际显示为准，每个请求不同；批准只针对当前一次调用，不会把工具永久改成 allow。`/cancel` 取消整轮并使旧审批编号失效。没有当前审批时，`/approve` 不会预先授权下一次调用。
+
+权限只作用于工具执行，不会阻止模型自行输出文本。deny 或人工拒绝产生 `is_error=true` 的 Tool Result，供模型解释；不要以模型说“已执行”为证据，应查看 `/context`。同批次中 allow 工具可以继续运行，ask 只阻止尚未批准的对应工具。
+
+等待批准不占用工具执行的 30 秒超时；没有输入通道时默认拒绝，避免脚本永久挂起。`/reset` 保留会话权限，重启恢复默认设置。本阶段没有磁盘规则、路径匹配或沙箱。权限配置在空闲时生效；运行中的 `/permission` 会排队到本轮结束，想立即停止请用 `/cancel`。
+
+运行真实 DeepSeek 与 TUI 权限回归（产生 API 用量）：
+
+```bash
+cargo build
+python3 tests/permission_tui.py
+```
+
+脚本需要 `tests/requirements-terminal.txt` 中的依赖；验证批准、拒绝、取消后过期编号无效，以及 reset 不清除权限。
+
 交互终端由 Reedline 统一绘制 `你: ` 输入行，支持中文宽度、退格、左右移动、跨行和粘贴。回答、排队提示、重试日志出现时，会输出在输入行上方并恢复尚未提交的草稿。输入历史只保存在内存，不自动写历史文件。
 
 等待回答期间仍可输入，收到普通输入后显示 `[已排队]` 和待处理条数。当前轮结束后显示 `[开始处理排队输入]` 及对应内容，再按顺序执行；空行不排队。`/cancel` 立即取消当前轮，其余输入（包括 `/context`、`/usage`、`/reset`、`/exit`）按队列顺序处理。取消当前轮不会清空已排队的输入。管道、重定向或 `TERM=dumb` 使用纯文本模式，不启用光标编辑。
@@ -38,6 +63,8 @@ API Key 只保存在本地 `.env` 中，请勿提交。
 - `src/context.rs`：强类型上下文、校验、检查点与失败回滚
 - `src/message.rs`：内部消息模型
 - `src/tools.rs`：工具定义与执行
+- `src/permission.rs`：权限值与异步审批通道
+- `src/approval_ui.rs`：TUI 待审批请求及单次批准/拒绝命令
 - `src/main.rs`：命令行交互
 - `src/terminal.rs`：中文行编辑、统一后台输出、终端退出恢复
 

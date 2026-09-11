@@ -1,6 +1,8 @@
+use crate::permission::{ToolApprover, ToolPermission};
 use chrono::Local;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 工具执行后的统一文本结果及错误标记。
@@ -32,6 +34,8 @@ pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn AgentTool>>,
     max_output_chars: usize,
     max_execution_time: Duration,
+    permissions: HashMap<String, ToolPermission>,
+    approver: Option<Arc<dyn ToolApprover>>,
 }
 
 impl ToolRegistry {
@@ -41,12 +45,48 @@ impl ToolRegistry {
             tools: HashMap::new(),
             max_output_chars: 8_000,
             max_execution_time: Duration::from_secs(30),
+            permissions: HashMap::new(),
+            approver: None,
         }
     }
 
-    /// 注册或替换同名工具。
+    /// 注册或替换工具；未显式指定权限的新实例需要人工批准。
     pub fn register<T: AgentTool + 'static>(&mut self, tool: T) {
-        self.tools.insert(tool.name().into(), Box::new(tool));
+        self.register_with_permission(tool, ToolPermission::Ask);
+    }
+
+    /// 注册工具时由调用方明确设置权限，替换实例时不继承旧的授权。
+    pub fn register_with_permission<T: AgentTool + 'static>(
+        &mut self,
+        tool: T,
+        permission: ToolPermission,
+    ) {
+        let name = tool.name().to_owned();
+        self.permissions.insert(name.clone(), permission);
+        self.tools.insert(name, Box::new(tool));
+    }
+
+    /// 修改已存在工具的会话权限，未知名称返回错误。
+    pub fn set_permission(&mut self, name: &str, permission: ToolPermission) -> anyhow::Result<()> {
+        anyhow::ensure!(self.tools.contains_key(name), "未知工具: {name}");
+        self.permissions.insert(name.to_owned(), permission);
+        Ok(())
+    }
+
+    /// 按名称排序返回权限列表，供 CLI 展示。
+    pub fn permissions(&self) -> Vec<(String, ToolPermission)> {
+        let mut entries: Vec<_> = self
+            .permissions
+            .iter()
+            .map(|(name, permission)| (name.clone(), *permission))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    /// 注入异步审批处理器；没有处理器时 ask 自动拒绝。
+    pub fn set_approver(&mut self, approver: Arc<dyn ToolApprover>) {
+        self.approver = Some(approver);
     }
 
     /// 汇总所有已注册工具的 Schema。
@@ -56,8 +96,30 @@ impl ToolRegistry {
 
     /// 按模型给出的名称执行工具；未知名称返回结构化错误。
     pub async fn execute(&self, name: &str, raw_args: &str) -> ToolOutput {
+        self.execute_call(name, raw_args, None).await
+    }
+
+    /// 权限通过后才创建工具执行 Future、开始执行计时；拒绝也返回配对工具结果。
+    async fn execute_call(&self, name: &str, raw_args: &str, call_id: Option<&str>) -> ToolOutput {
         let output = match self.tools.get(name) {
             Some(tool) => {
+                let allowed = match self.permissions.get(name).copied().unwrap_or_default() {
+                    ToolPermission::Allow => true,
+                    ToolPermission::Deny => false,
+                    ToolPermission::Ask => match &self.approver {
+                        Some(approver) => approver.approve(name, raw_args, call_id).await,
+                        None => false,
+                    },
+                };
+                if !allowed {
+                    return truncate_output(
+                        ToolOutput {
+                            content: format!("工具执行失败: 权限拒绝或未获批准: {name}"),
+                            is_error: true,
+                        },
+                        self.max_output_chars,
+                    );
+                }
                 match tokio::time::timeout(self.max_execution_time, tool.execute(raw_args)).await {
                     Ok(output) => output,
                     Err(_) => ToolOutput {
@@ -90,7 +152,9 @@ impl ToolRegistry {
                 ToolExecutionResult {
                     index,
                     call_id,
-                    output: self.execute(&call.name, &call.arguments).await,
+                    output: self
+                        .execute_call(&call.name, &call.arguments, Some(&call.id))
+                        .await,
                 }
             });
         }
@@ -120,9 +184,9 @@ impl Default for ToolRegistry {
     /// 创建包含 Asteria 内置工具的默认注册中心。
     fn default() -> Self {
         let mut registry = Self::new();
-        registry.register(CalculateTool);
-        registry.register(CurrentTimeTool);
-        registry.register(WaitForTool);
+        registry.register_with_permission(CalculateTool, ToolPermission::Allow);
+        registry.register_with_permission(CurrentTimeTool, ToolPermission::Allow);
+        registry.register_with_permission(WaitForTool, ToolPermission::Allow);
         registry
     }
 }
@@ -319,7 +383,7 @@ mod tests {
     /// 验证注册工具的超长结果被截断到默认 8000 字符并保留中文边界。
     async fn registry_truncates_large_tool_output() {
         let mut registry = ToolRegistry::new();
-        registry.register(LargeOutputTool);
+        registry.register_with_permission(LargeOutputTool, ToolPermission::Allow);
         let output = registry.execute("large_output", "{}").await;
 
         assert!(!output.is_error);
@@ -356,7 +420,7 @@ mod tests {
     /// 验证工具超时会返回错误结果，而不是拖住 Agent Loop。
     async fn registry_times_out_slow_tool() {
         let mut registry = ToolRegistry::with_execution_timeout(Duration::from_millis(5));
-        registry.register(SleepingTool);
+        registry.register_with_permission(SleepingTool, ToolPermission::Allow);
         let output = registry.execute("sleeping", "{}").await;
         assert!(output.is_error);
         assert!(output.content.contains("执行超时"));
@@ -373,5 +437,120 @@ mod tests {
         let result = registry.execute("wait_for", "{\"seconds\":1}").await;
         assert!(!result.is_error);
         assert!(result.content.contains("已等待"));
+    }
+
+    /// 记录执行次数，确保被拒绝的调用连工具函数都没有进入。
+    struct CountedTool(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl AgentTool for CountedTool {
+        /// 返回计数测试工具名。
+        fn name(&self) -> &str {
+            "counted"
+        }
+        /// 返回最小测试 Schema。
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"counted","parameters":{"type":"object"}}})
+        }
+        /// 计数增加即表示工具真实启动。
+        async fn execute(&self, args: &str) -> ToolOutput {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ToolOutput {
+                content: args.to_owned(),
+                is_error: false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    /// 默认 ask 无审批器、显式 deny 均不执行；显式 allow 才执行。
+    async fn permissions_gate_execution() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountedTool(count.clone()));
+        assert!(registry.execute("counted", "{}").await.is_error);
+        registry
+            .set_permission("counted", ToolPermission::Deny)
+            .unwrap();
+        assert!(registry.execute("counted", "{}").await.is_error);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        registry
+            .set_permission("counted", ToolPermission::Allow)
+            .unwrap();
+        assert!(!registry.execute("counted", "{}").await.is_error);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            registry
+                .set_permission("missing", ToolPermission::Allow)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    /// 批准不缓存：下一次同名调用仍需批准；审批时间不计入执行超时。
+    async fn ask_is_per_call_and_outside_execution_timeout() {
+        use crate::permission::ChannelApprover;
+        use std::sync::atomic::Ordering;
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::with_execution_timeout(Duration::from_millis(5));
+        registry.register(CountedTool(count.clone()));
+        let (approver, mut requests) = ChannelApprover::channel();
+        registry.set_approver(Arc::new(approver));
+        for (id, allowed) in [(1, true), (2, false)] {
+            let (output, ()) = tokio::join!(registry.execute("counted", "{}"), async {
+                let request = requests.recv().await.unwrap();
+                assert_eq!(request.id, id);
+                assert_eq!(request.tool_name, "counted");
+                assert_eq!(request.arguments, "{}");
+                assert_eq!(count.load(Ordering::SeqCst), usize::from(id == 2));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                request.reply.send(allowed).unwrap();
+            });
+            assert_eq!(output.is_error, !allowed);
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+        drop(requests);
+        assert!(registry.execute("counted", "{}").await.is_error);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    /// 并发工具使用不同审批编号，乱序批准不混淆调用参数和 call_id。
+    async fn parallel_approvals_are_independent() {
+        use crate::{message::ToolCall, permission::ChannelApprover};
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountedTool(count.clone()));
+        let (approver, mut requests) = ChannelApprover::channel();
+        registry.set_approver(Arc::new(approver));
+        let calls = vec![
+            ToolCall {
+                id: "a".into(),
+                name: "counted".into(),
+                arguments: "{\"value\":1}".into(),
+            },
+            ToolCall {
+                id: "b".into(),
+                name: "counted".into(),
+                arguments: "{\"value\":2}".into(),
+            },
+        ];
+        let (results, ()) = tokio::join!(registry.execute_batch(&calls), async {
+            let a = requests.recv().await.unwrap();
+            let b = requests.recv().await.unwrap();
+            assert_ne!(a.id, b.id);
+            assert_ne!(a.call_id, b.call_id);
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let b_allowed = b.call_id.as_deref() == Some("b");
+            b.reply.send(b_allowed).unwrap();
+            let a_allowed = a.call_id.as_deref() == Some("b");
+            a.reply.send(a_allowed).unwrap();
+        });
+        assert_eq!(results[0].call_id, "a");
+        assert!(results[0].output.is_error);
+        assert_eq!(results[1].call_id, "b");
+        assert!(!results[1].output.is_error);
+        assert_eq!(results[1].output.content, calls[1].arguments);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
