@@ -5,6 +5,7 @@ use crate::{
     tools,
 };
 use anyhow::{Result, bail};
+use std::collections::{HashMap, HashSet};
 /// 可克隆的异步取消信号，取消后唤醒所有 cancelled() 等待者。
 pub use tokio_util::sync::CancellationToken as CancelToken;
 
@@ -58,6 +59,7 @@ pub struct AgentLoop<P> {
     retry_policy: crate::retry::RetryPolicy,
     retry_output: Option<Box<dyn Fn(String) + Send + Sync>>,
     tool_registry: tools::ToolRegistry,
+    tool_call_keys: HashSet<String>,
 }
 
 impl<P: ModelProvider> AgentLoop<P> {
@@ -81,6 +83,7 @@ impl<P: ModelProvider> AgentLoop<P> {
             session_usage: TokenUsage::default(),
             retry_policy: crate::retry::RetryPolicy::default(),
             tool_registry: tools::ToolRegistry::default(),
+            tool_call_keys: HashSet::new(),
             retry_output: None,
         }
     }
@@ -146,6 +149,7 @@ impl<P: ModelProvider> AgentLoop<P> {
             usage: TokenUsage::default(),
             retries: 0,
         });
+        self.tool_call_keys.clear();
     }
 
     /// 逐 Step 请求模型、执行工具，直到得到最终答案或达到上限。
@@ -222,19 +226,39 @@ impl<P: ModelProvider> AgentLoop<P> {
             }
 
             self.transition(TurnState::WaitingForTools);
+            let mut runnable = Vec::new();
+            let mut duplicate_ids = HashSet::new();
+            for call in &calls {
+                let key = format!("{}:{}", call.name, call.arguments);
+                if self.tool_call_keys.insert(key) {
+                    runnable.push(call.clone());
+                } else {
+                    duplicate_ids.insert(call.id.clone());
+                }
+            }
             let results = tokio::select! {
-                results = self.tool_registry.execute_batch(&calls) => results,
+                results = self.tool_registry.execute_batch(&runnable) => results,
                     _ = cancel.cancelled() => {
                         self.transition(TurnState::Cancelled);
                         bail!("当前 Turn 已取消");
                     }
             };
-            for result in results {
-                context.append_tool_result(
-                    result.call_id,
-                    result.output.content,
-                    result.output.is_error,
-                )?;
+            let mut outputs: HashMap<String, tools::ToolOutput> = results
+                .into_iter()
+                .map(|result| (result.call_id, result.output))
+                .collect();
+            for call in calls {
+                let output = outputs
+                    .remove(&call.id)
+                    .unwrap_or_else(|| tools::ToolOutput {
+                        content: if duplicate_ids.contains(&call.id) {
+                            "工具执行失败: 当前 Turn 已重复调用相同工具和参数".into()
+                        } else {
+                            "工具执行失败: 缺少工具结果".into()
+                        },
+                        is_error: true,
+                    });
+                context.append_tool_result(call.id, output.content, output.is_error)?;
             }
             self.transition(TurnState::Running);
         }
