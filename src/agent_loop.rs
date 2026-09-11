@@ -224,7 +224,13 @@ impl<P: ModelProvider> AgentLoop<P> {
             self.transition(TurnState::WaitingForTools);
             for call in calls {
                 self.ensure_not_cancelled(cancel)?;
-                let output = self.tool_registry.execute(&call.name, &call.arguments);
+                let output = tokio::select! {
+                    output = self.tool_registry.execute(&call.name, &call.arguments) => output,
+                    _ = cancel.cancelled() => {
+                        self.transition(TurnState::Cancelled);
+                        bail!("当前 Turn 已取消");
+                    }
+                };
                 context.append_tool_result(call.id, output.content, output.is_error)?;
             }
             self.transition(TurnState::Running);

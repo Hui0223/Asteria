@@ -1,6 +1,7 @@
 use chrono::Local;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// 工具执行后的统一文本结果及错误标记。
 pub struct ToolOutput {
@@ -9,19 +10,21 @@ pub struct ToolOutput {
 }
 
 /// 定义一个可被模型发现和调用的工具。
+#[async_trait::async_trait]
 pub trait AgentTool: Send + Sync {
     /// 返回稳定的工具名称。
     fn name(&self) -> &str;
     /// 返回发送给模型的 OpenAI/DeepSeek 工具 Schema。
     fn schema(&self) -> Value;
     /// 校验原始 JSON 参数并执行工具。
-    fn execute(&self, raw_args: &str) -> ToolOutput;
+    async fn execute(&self, raw_args: &str) -> ToolOutput;
 }
 
 /// 保存工具实例，并负责 Schema 汇总和按名称分发。
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn AgentTool>>,
     max_output_chars: usize,
+    max_execution_time: Duration,
 }
 
 impl ToolRegistry {
@@ -30,6 +33,7 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             max_output_chars: 8_000,
+            max_execution_time: Duration::from_secs(30),
         }
     }
 
@@ -44,9 +48,20 @@ impl ToolRegistry {
     }
 
     /// 按模型给出的名称执行工具；未知名称返回结构化错误。
-    pub fn execute(&self, name: &str, raw_args: &str) -> ToolOutput {
+    pub async fn execute(&self, name: &str, raw_args: &str) -> ToolOutput {
         let output = match self.tools.get(name) {
-            Some(tool) => tool.execute(raw_args),
+            Some(tool) => {
+                match tokio::time::timeout(self.max_execution_time, tool.execute(raw_args)).await {
+                    Ok(output) => output,
+                    Err(_) => ToolOutput {
+                        content: format!(
+                            "工具执行失败: 执行超时（超过 {} 秒）",
+                            self.max_execution_time.as_secs()
+                        ),
+                        is_error: true,
+                    },
+                }
+            }
             None => ToolOutput {
                 content: format!("工具执行失败: 未知工具: {name}"),
                 is_error: true,
@@ -59,6 +74,14 @@ impl ToolRegistry {
     pub fn with_max_output_chars(max_output_chars: usize) -> Self {
         Self {
             max_output_chars: max_output_chars.max(1),
+            ..Self::default()
+        }
+    }
+
+    /// 创建带自定义工具执行时限的默认注册中心。
+    pub fn with_execution_timeout(max_execution_time: Duration) -> Self {
+        Self {
+            max_execution_time: max_execution_time.max(Duration::from_millis(1)),
             ..Self::default()
         }
     }
@@ -76,6 +99,7 @@ impl Default for ToolRegistry {
 
 /// 计算数学表达式的内置工具。
 pub struct CalculateTool;
+#[async_trait::async_trait]
 impl AgentTool for CalculateTool {
     /// 返回工具名 calculate。
     fn name(&self) -> &str {
@@ -86,7 +110,7 @@ impl AgentTool for CalculateTool {
         json!({"type":"function","function":{"name":"calculate","description":"计算一个数学表达式","parameters":{"type":"object","properties":{"expression":{"type":"string","description":"例如 (12+3)*4"}},"required":["expression"]}}})
     }
     /// 校验 expression 长度并执行表达式。
-    fn execute(&self, raw_args: &str) -> ToolOutput {
+    async fn execute(&self, raw_args: &str) -> ToolOutput {
         execute_result(raw_args, |args| {
             let expression = args["expression"].as_str().ok_or("缺少 expression 参数")?;
             if expression.len() > 200 {
@@ -101,6 +125,7 @@ impl AgentTool for CalculateTool {
 
 /// 获取本机当前时间的内置工具。
 pub struct CurrentTimeTool;
+#[async_trait::async_trait]
 impl AgentTool for CurrentTimeTool {
     /// 返回工具名 current_time。
     fn name(&self) -> &str {
@@ -111,7 +136,7 @@ impl AgentTool for CurrentTimeTool {
         json!({"type":"function","function":{"name":"current_time","description":"获取运行机器的当前本地时间","parameters":{"type":"object","properties":{}}}})
     }
     /// 忽略空对象以外的字段并返回 RFC3339 本地时间。
-    fn execute(&self, raw_args: &str) -> ToolOutput {
+    async fn execute(&self, raw_args: &str) -> ToolOutput {
         execute_result(raw_args, |_| Ok(Local::now().to_rfc3339()))
     }
 }
@@ -154,8 +179,8 @@ pub fn schema() -> Value {
 }
 
 /// 执行默认注册中心中的工具，保留旧调用入口。
-pub fn execute(name: &str, raw_args: &str) -> ToolOutput {
-    ToolRegistry::default().execute(name, raw_args)
+pub async fn execute(name: &str, raw_args: &str) -> ToolOutput {
+    ToolRegistry::default().execute(name, raw_args).await
 }
 
 #[cfg(test)]
@@ -171,18 +196,18 @@ mod tests {
         assert!(schema.to_string().contains("current_time"));
     }
 
-    #[test]
+    #[tokio::test]
     /// 未知工具必须返回错误结果而不是 panic。
-    fn unknown_tool_is_structured_error() {
-        let output = ToolRegistry::default().execute("missing", "{}");
+    async fn unknown_tool_is_structured_error() {
+        let output = ToolRegistry::default().execute("missing", "{}").await;
         assert!(output.is_error);
         assert!(output.content.contains("未知工具"));
     }
 
-    #[test]
+    #[tokio::test]
     /// 参数错误会进入工具结果，便于模型在下一 Step 修正。
-    fn invalid_arguments_are_tool_errors() {
-        let output = ToolRegistry::default().execute("calculate", "{}");
+    async fn invalid_arguments_are_tool_errors() {
+        let output = ToolRegistry::default().execute("calculate", "{}").await;
         assert!(output.is_error);
         assert!(output.content.contains("缺少 expression"));
     }
@@ -205,6 +230,7 @@ mod tests {
     /// 只用于测试注册中心：返回 10000 个中文字符的超长结果。
     struct LargeOutputTool;
 
+    #[async_trait::async_trait]
     impl AgentTool for LargeOutputTool {
         /// 返回测试工具名称。
         fn name(&self) -> &str {
@@ -215,7 +241,7 @@ mod tests {
             json!({"type":"function","function":{"name":"large_output","description":"返回超长测试内容","parameters":{"type":"object","properties":{}}}})
         }
         /// 生成用于触发截断逻辑的 10000 个字符。
-        fn execute(&self, _: &str) -> ToolOutput {
+        async fn execute(&self, _: &str) -> ToolOutput {
             ToolOutput {
                 content: "你好".repeat(5000),
                 is_error: false,
@@ -223,12 +249,12 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     /// 验证注册工具的超长结果被截断到默认 8000 字符并保留中文边界。
-    fn registry_truncates_large_tool_output() {
+    async fn registry_truncates_large_tool_output() {
         let mut registry = ToolRegistry::new();
         registry.register(LargeOutputTool);
-        let output = registry.execute("large_output", "{}");
+        let output = registry.execute("large_output", "{}").await;
 
         assert!(!output.is_error);
         assert!(output.content.contains("工具结果已截断"));
