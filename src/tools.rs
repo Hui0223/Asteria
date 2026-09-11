@@ -201,4 +201,39 @@ mod tests {
         assert!(output.content.contains("工具结果已截断"));
         assert!(!output.is_error);
     }
+
+    /// 只用于测试注册中心：返回 10000 个中文字符的超长结果。
+    struct LargeOutputTool;
+
+    impl AgentTool for LargeOutputTool {
+        /// 返回测试工具名称。
+        fn name(&self) -> &str {
+            "large_output"
+        }
+        /// 返回测试工具的最小 JSON Schema。
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"large_output","description":"返回超长测试内容","parameters":{"type":"object","properties":{}}}})
+        }
+        /// 生成用于触发截断逻辑的 10000 个字符。
+        fn execute(&self, _: &str) -> ToolOutput {
+            ToolOutput {
+                content: "你好".repeat(5000),
+                is_error: false,
+            }
+        }
+    }
+
+    #[test]
+    /// 验证注册工具的超长结果被截断到默认 8000 字符并保留中文边界。
+    fn registry_truncates_large_tool_output() {
+        let mut registry = ToolRegistry::new();
+        registry.register(LargeOutputTool);
+        let output = registry.execute("large_output", "{}");
+
+        assert!(!output.is_error);
+        assert!(output.content.contains("工具结果已截断"));
+        assert!(output.content.contains("原始 10000 字符"));
+        assert!(output.content.contains("最多保留 8000 字符"));
+        assert!(output.content.starts_with(&"你好".repeat(4000)));
+    }
 }
