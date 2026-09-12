@@ -257,15 +257,28 @@ fn latest_requires_calculation(messages: &[Message]) -> bool {
     let Message::User { content } = &messages[user_index] else {
         return false;
     };
+    // “打印一行文字：计算1+1”是在复述文字，不是在请求计算。
+    if (content.contains("打印") || content.contains("输出")) && content.contains("文字") {
+        return false;
+    }
     let has_math_marker = content.contains("计算")
         || content.contains("算出")
         || content.contains("求")
         || content.contains("calculate");
     let has_operator = content
         .chars()
-        .any(|character| "+-*/^×÷=".contains(character))
-        && content.chars().any(|character| character.is_ascii_digit());
-    has_math_marker && has_operator
+        .any(|character| "+-*/^×÷=".contains(character));
+    let has_number = content.chars().any(|character| character.is_ascii_digit());
+    let compact = content
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let is_bare_expression = has_number
+        && has_operator
+        && compact
+            .chars()
+            .all(|character| character.is_ascii_digit() || ".+-*/^()×÷".contains(character));
+    (has_math_marker && has_operator && has_number) || is_bare_expression
 }
 
 /// 为被省略的旧消息生成不依赖模型的保守摘要，避免摘要过程递归调用模型。
@@ -536,6 +549,28 @@ mod tests {
     fn does_not_force_calculation_for_normal_chat() {
         let mut memory = ContextMemory::new("system");
         memory.append_user("我有 1 个问题，今天心情很好").unwrap();
+        let prepared = ContextBuilder::new(ContextPolicy::default(), CharacterEstimator)
+            .prepare(&memory, &json!([]))
+            .unwrap();
+        assert!(!prepared.force_calculation());
+    }
+
+    #[test]
+    /// 裸算式没有“计算”关键词，也必须触发 calculate。
+    fn forces_bare_arithmetic_expression() {
+        let mut memory = ContextMemory::new("system");
+        memory.append_user("1+1").unwrap();
+        let prepared = ContextBuilder::new(ContextPolicy::default(), CharacterEstimator)
+            .prepare(&memory, &json!([]))
+            .unwrap();
+        assert!(prepared.force_calculation());
+    }
+
+    #[test]
+    /// 打印包含算式的文字时，必须保留文本任务语义，不能误调用 calculate。
+    fn does_not_calculate_quoted_text() {
+        let mut memory = ContextMemory::new("system");
+        memory.append_user("帮我打印一行文字‘计算1+1’").unwrap();
         let prepared = ContextBuilder::new(ContextPolicy::default(), CharacterEstimator)
             .prepare(&memory, &json!([]))
             .unwrap();
