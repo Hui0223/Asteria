@@ -26,6 +26,15 @@ pub enum AgentEvent {
         step: usize,
         usage: TokenUsage,
     },
+    /// 一次模型请求失败但准备重试；不会增加 Step 数。
+    StepRetrying {
+        turn_id: u64,
+        step: usize,
+        failed_attempt: usize,
+        next_attempt: usize,
+        max_attempts: usize,
+        delay_ms: u128,
+    },
     TurnCompleted {
         turn_id: u64,
         steps: usize,

@@ -140,6 +140,16 @@ impl EventSink for TuiEventSink {
                 "[Event][Turn {turn_id}][Step {step}] completed: tokens={}",
                 usage.total_tokens
             ),
+            AgentEvent::StepRetrying {
+                turn_id,
+                step,
+                failed_attempt,
+                next_attempt,
+                max_attempts,
+                delay_ms,
+            } => format!(
+                "[Event][Turn {turn_id}][Step {step}] retrying: attempt {failed_attempt} failed, next={next_attempt}/{max_attempts}, delay={delay_ms}ms"
+            ),
             AgentEvent::TurnCompleted { turn_id, steps } => {
                 format!("[Event][Turn {turn_id}] completed: steps={steps}")
             }

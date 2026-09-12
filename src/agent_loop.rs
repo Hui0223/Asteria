@@ -247,6 +247,14 @@ impl<P: ModelProvider> AgentLoop<P> {
                         if let Some(turn) = &mut self.last_turn {
                             turn.retries += 1;
                         }
+                        self.event_sink.publish(AgentEvent::StepRetrying {
+                            turn_id,
+                            step: step_number,
+                            failed_attempt: attempt,
+                            next_attempt: attempt + 1,
+                            max_attempts: self.retry_policy.max_attempts,
+                            delay_ms: delay.as_millis(),
+                        });
                         let notice = format!(
                             "[Retry] attempt={}/{} delay={}ms",
                             attempt + 1,
