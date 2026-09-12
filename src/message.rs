@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 /// 与供应商无关的工具调用，参数保留为原始 JSON 字符串。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -7,7 +9,7 @@ pub struct ToolCall {
 }
 
 /// Agent 内部使用的强类型消息，避免直接操作供应商 JSON。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     User {
         content: String,

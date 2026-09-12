@@ -1,11 +1,12 @@
 use crate::{context_builder::PreparedContext, message::ToolCall};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod deepseek;
 
 /// 记录模型服务端返回的本次请求 Token 消耗。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
