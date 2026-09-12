@@ -4,6 +4,7 @@ pub mod agent;
 pub mod agent_loop;
 pub mod context;
 pub mod context_builder;
+pub mod events;
 pub mod message;
 pub mod permission;
 pub mod provider;

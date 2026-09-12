@@ -65,6 +65,11 @@ impl Asteria {
         self.agent_loop.set_tool_approver(approver);
     }
 
+    /// 注入事件接收器，供 TUI、Transcript 和评估系统订阅执行过程。
+    pub fn set_event_sink(&mut self, sink: std::sync::Arc<dyn crate::events::EventSink>) {
+        self.agent_loop.set_event_sink(sink);
+    }
+
     /// 读取最近一轮报告，包括失败、取消和重试信息。
     pub fn last_turn(&self) -> Option<&TurnReport> {
         self.agent_loop.last_turn()

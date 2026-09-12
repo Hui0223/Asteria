@@ -1,6 +1,7 @@
 use crate::{
     context::ContextMemory,
     context_builder::{ContextBuilder, ContextPolicy, HeuristicTokenEstimator},
+    events::{AgentEvent, EventSink, NoopEventSink},
     provider::{ModelProvider, TokenUsage},
     tools,
 };
@@ -60,6 +61,7 @@ pub struct AgentLoop<P> {
     retry_output: Option<Box<dyn Fn(String) + Send + Sync>>,
     tool_registry: tools::ToolRegistry,
     tool_call_keys: HashSet<String>,
+    event_sink: std::sync::Arc<dyn EventSink>,
 }
 
 impl<P: ModelProvider> AgentLoop<P> {
@@ -84,6 +86,7 @@ impl<P: ModelProvider> AgentLoop<P> {
             retry_policy: crate::retry::RetryPolicy::default(),
             tool_registry: tools::ToolRegistry::default(),
             tool_call_keys: HashSet::new(),
+            event_sink: std::sync::Arc::new(NoopEventSink),
             retry_output: None,
         }
     }
@@ -91,6 +94,11 @@ impl<P: ModelProvider> AgentLoop<P> {
     /// 返回底层供应商实际使用的模型名称。
     pub fn model(&self) -> &str {
         self.provider.model()
+    }
+
+    /// 设置事件接收器；之后每个 Turn、Step 和 ToolCall 都会发出事件。
+    pub fn set_event_sink(&mut self, sink: std::sync::Arc<dyn EventSink>) {
+        self.event_sink = sink;
     }
 
     /// 注入重试信息的输出入口，使 CLI 能在重绘输入行时安全显示日志。
@@ -145,19 +153,32 @@ impl<P: ModelProvider> AgentLoop<P> {
         cancel: &CancelToken,
     ) -> Result<String> {
         let checkpoint = context.checkpoint();
-        self.begin_turn();
+        self.begin_turn(input);
         let result = self.run_steps(context, input, cancel).await;
         if result.is_err() {
             context.rollback(checkpoint);
-            if self.current_state() != TurnState::Cancelled {
+            let turn_id = self.last_turn.as_ref().map_or(0, |turn| turn.id);
+            if self.current_state() == TurnState::Cancelled {
+                self.event_sink
+                    .publish(AgentEvent::TurnCancelled { turn_id });
+            } else {
                 self.transition(TurnState::Failed);
+                self.event_sink.publish(AgentEvent::TurnFailed {
+                    turn_id,
+                    message: "Turn 执行失败".into(),
+                });
             }
+        } else if let Some(turn) = &self.last_turn {
+            self.event_sink.publish(AgentEvent::TurnCompleted {
+                turn_id: turn.id,
+                steps: turn.steps,
+            });
         }
         result
     }
 
     /// 分配唯一 Turn ID，并初始化该 Turn 的状态轨迹。
-    fn begin_turn(&mut self) {
+    fn begin_turn(&mut self, input: &str) {
         let id = self.next_turn_id;
         self.next_turn_id += 1;
         self.last_turn = Some(TurnReport {
@@ -172,6 +193,10 @@ impl<P: ModelProvider> AgentLoop<P> {
             retries: 0,
         });
         self.tool_call_keys.clear();
+        self.event_sink.publish(AgentEvent::TurnStarted {
+            turn_id: id,
+            input: input.to_owned(),
+        });
     }
 
     /// 逐 Step 请求模型、执行工具，直到得到最终答案或达到上限。
@@ -187,6 +212,12 @@ impl<P: ModelProvider> AgentLoop<P> {
         for _ in 0..self.config.max_steps_per_turn {
             self.ensure_not_cancelled(cancel)?;
             self.increment_steps();
+            let turn_id = self.last_turn.as_ref().map_or(0, |turn| turn.id);
+            let step_number = self.last_turn.as_ref().map_or(0, |turn| turn.steps);
+            self.event_sink.publish(AgentEvent::StepStarted {
+                turn_id,
+                step: step_number,
+            });
             let tool_schema = self.tool_registry.schema();
             let prepared = self.context_builder.prepare(context, &tool_schema)?;
             self.record_prepared_context(prepared.estimated_tokens(), prepared.truncated());
@@ -236,6 +267,11 @@ impl<P: ModelProvider> AgentLoop<P> {
             };
             if let Some(usage) = &message.usage {
                 self.record_usage(usage);
+                self.event_sink.publish(AgentEvent::StepCompleted {
+                    turn_id,
+                    step: step_number,
+                    usage: usage.clone(),
+                });
             }
             self.ensure_not_cancelled(cancel)?;
             let calls = message.tool_calls;
@@ -251,6 +287,11 @@ impl<P: ModelProvider> AgentLoop<P> {
             let mut runnable = Vec::new();
             let mut duplicate_ids = HashSet::new();
             for call in &calls {
+                self.event_sink.publish(AgentEvent::ToolCallStarted {
+                    turn_id,
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                });
                 let key = format!("{}:{}", call.name, call.arguments);
                 if self.tool_call_keys.insert(key) {
                     runnable.push(call.clone());
@@ -280,7 +321,14 @@ impl<P: ModelProvider> AgentLoop<P> {
                         },
                         is_error: true,
                     });
-                context.append_tool_result(call.id, output.content, output.is_error)?;
+                let call_id = call.id;
+                let is_error = output.is_error;
+                context.append_tool_result(call_id.clone(), output.content, is_error)?;
+                self.event_sink.publish(AgentEvent::ToolResult {
+                    turn_id,
+                    call_id,
+                    is_error,
+                });
             }
             self.transition(TurnState::Running);
         }
@@ -739,6 +787,43 @@ mod tests {
         assert_eq!(engine.last_turn().unwrap().state, TurnState::Cancelled);
         assert_eq!(engine.session_usage().total_tokens, 12);
         assert!(memory.messages().is_empty());
+    }
+
+    #[tokio::test]
+    /// 验证事件顺序包含 Turn、Step、工具和完成事件。
+    async fn publishes_execution_events() {
+        struct Sink(std::sync::Mutex<Vec<AgentEvent>>);
+        impl EventSink for Sink {
+            /// 保存事件供断言使用。
+            fn publish(&self, event: AgentEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+        let sink = std::sync::Arc::new(Sink(std::sync::Mutex::new(Vec::new())));
+        let provider = FakeProvider::new(vec![calculate_call("event-tool"), answer("2")]);
+        let mut engine = AgentLoop::new(provider, LoopConfig::default());
+        engine.set_event_sink(sink.clone());
+        let mut context = ContextMemory::new("system");
+        engine
+            .run_turn(&mut context, "1+1", &CancelToken::new())
+            .await
+            .unwrap();
+        let events = sink.0.lock().unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(AgentEvent::TurnStarted { .. })
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::StepStarted { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolCallStarted { call_id, .. } if call_id == "event-tool")));
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolResult { call_id, is_error: false, .. } if call_id == "event-tool")));
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnCompleted { .. })
+        ));
     }
 
     #[tokio::test]
