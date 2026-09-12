@@ -267,12 +267,12 @@ impl<P: ModelProvider> AgentLoop<P> {
             };
             if let Some(usage) = &message.usage {
                 self.record_usage(usage);
-                self.event_sink.publish(AgentEvent::StepCompleted {
-                    turn_id,
-                    step: step_number,
-                    usage: usage.clone(),
-                });
             }
+            self.event_sink.publish(AgentEvent::StepCompleted {
+                turn_id,
+                step: step_number,
+                usage: message.usage.clone().unwrap_or_default(),
+            });
             self.ensure_not_cancelled(cancel)?;
             let calls = message.tool_calls;
             context.append_assistant(message.content.clone(), calls.clone())?;
