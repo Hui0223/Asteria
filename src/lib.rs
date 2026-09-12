@@ -9,4 +9,5 @@ pub mod message;
 pub mod permission;
 pub mod provider;
 pub mod retry;
+pub mod session;
 pub mod tools;

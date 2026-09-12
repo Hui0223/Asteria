@@ -9,6 +9,15 @@ pub struct ContextMemory {
 }
 
 impl ContextMemory {
+    /// 从已重放的消息创建上下文，并验证工具消息仍然完整配对。
+    pub fn restore(system_prompt: impl Into<String>, messages: Vec<Message>) -> Result<Self> {
+        let context = Self {
+            system_prompt: system_prompt.into(),
+            messages,
+        };
+        context.validate()?;
+        Ok(context)
+    }
     /// 创建一份空的上下文记忆，并保存不会随重置丢失的系统提示词。
     pub fn new(system_prompt: impl Into<String>) -> Self {
         Self {

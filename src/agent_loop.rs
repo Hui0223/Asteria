@@ -145,6 +145,12 @@ impl<P: ModelProvider> AgentLoop<P> {
         &self.session_usage
     }
 
+    /// 恢复持久化会话的下一个 Turn 编号和累计 Token。
+    pub fn restore_session_state(&mut self, next_turn_id: u64, usage: TokenUsage) {
+        self.next_turn_id = next_turn_id.max(1);
+        self.session_usage = usage;
+    }
+
     /// 异步执行 Turn；取消请发信号并等待本方法结束，以完成回滚，勿直接丢弃此 Future。
     pub async fn run_turn(
         &mut self,

@@ -3,6 +3,7 @@ use crate::{
     context::ContextMemory,
     provider::TokenUsage,
     provider::deepseek::DeepSeekProvider,
+    session::SessionStore,
 };
 use anyhow::Result;
 
@@ -12,14 +13,20 @@ const SYSTEM: &str = "你是 Asteria，一个可靠、简洁的中文 AI 助手�
 pub struct Asteria {
     agent_loop: AgentLoop<DeepSeekProvider>,
     context: ContextMemory,
+    session: SessionStore,
 }
 
 impl Asteria {
     /// 根据环境变量创建 DeepSeek Agent，并采用默认 Loop 配置。
     pub fn new() -> Result<Self> {
+        let session = SessionStore::from_env()?;
+        let restored = session.restore(SYSTEM)?;
+        let mut agent_loop = AgentLoop::new(DeepSeekProvider::from_env()?, LoopConfig::default());
+        agent_loop.restore_session_state(restored.next_turn_id, restored.usage);
         Ok(Self {
-            agent_loop: AgentLoop::new(DeepSeekProvider::from_env()?, LoopConfig::default()),
-            context: ContextMemory::new(SYSTEM),
+            agent_loop,
+            context: restored.context,
+            session,
         })
     }
 
@@ -83,6 +90,9 @@ impl Asteria {
     /// 清空对话历史，但保留 Agent 的系统设定。
     pub fn reset(&mut self) {
         self.context.reset();
+        if let Err(error) = self.session.clear() {
+            eprintln!("清空会话持久化失败: {error:#}");
+        }
     }
 
     /// 使用一个新的取消令牌执行完整用户 Turn。
@@ -92,8 +102,19 @@ impl Asteria {
 
     /// 使用调用方提供的令牌执行 Turn，以支持协作式取消。
     pub async fn ask_with_cancel(&mut self, input: &str, cancel: &CancelToken) -> Result<String> {
-        self.agent_loop
+        let before = self.context.messages().len();
+        let result = self
+            .agent_loop
             .run_turn(&mut self.context, input, cancel)
-            .await
+            .await;
+        if result.is_ok()
+            && let Some(turn) = self.agent_loop.last_turn()
+            && let Err(error) =
+                self.session
+                    .append_turn(&self.context.messages()[before..], turn.id, &turn.usage)
+        {
+            eprintln!("会话持久化失败（本轮仍已完成）: {error:#}");
+        }
+        result
     }
 }
