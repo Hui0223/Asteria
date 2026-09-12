@@ -94,7 +94,7 @@ async fn run_case(
         }) = errors.first().copied()
         {
             assert_eq!(call_id, "bad-1");
-            assert_eq!(content, "工具执行失败: 缺少 expression 参数");
+            assert_eq!(content, "工具执行失败: 参数校验失败: 缺少 expression 参数");
         }
         // 网络错误不会增加任何消息：每次重试看到的消息完全一致。
         if index > usize::from(tool_error_visible) {
