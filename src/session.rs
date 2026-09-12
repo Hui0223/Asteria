@@ -134,3 +134,99 @@ fn write_event(file: &mut File, event: &SessionEvent) -> Result<()> {
     writeln!(file, "{}", serde_json::to_string(event)?)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Message;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// 创建本测试专用的临时 JSONL 路径，避免触碰用户会话。
+    fn test_path() -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("asteria-session-test-{id}.jsonl"))
+    }
+
+    #[test]
+    /// 验证消息、Turn ID 和 Token Usage 可以跨 Store 实例恢复。
+    fn persists_and_restores_completed_turn() {
+        let path = test_path();
+        let store = SessionStore { path: path.clone() };
+        let messages = vec![
+            Message::User {
+                content: "hello".into(),
+            },
+            Message::Assistant {
+                content: Some("world".into()),
+                tool_calls: Vec::new(),
+            },
+        ];
+        let usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+        };
+        store.append_turn(&messages, 7, &usage).unwrap();
+        let restored = store.restore("system").unwrap();
+        assert_eq!(restored.next_turn_id, 8);
+        assert_eq!(restored.usage, usage);
+        assert_eq!(restored.context.messages(), messages);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    /// 验证没有 TurnCompleted 的半批次不会进入恢复后的 Context。
+    fn ignores_incomplete_turn_batch() {
+        let path = test_path();
+        let store = SessionStore { path: path.clone() };
+        let mut file = File::create(&path).unwrap();
+        write_event(
+            &mut file,
+            &SessionEvent::Message {
+                message: Message::User {
+                    content: "unfinished".into(),
+                },
+            },
+        )
+        .unwrap();
+        drop(file);
+        let restored = store.restore("system").unwrap();
+        assert!(restored.context.messages().is_empty());
+        assert_eq!(restored.next_turn_id, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    /// 验证损坏的最后一行不会阻止之前已完成 Turn 的恢复。
+    fn skips_corrupted_tail_line() {
+        let path = test_path();
+        let store = SessionStore { path: path.clone() };
+        let usage = TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        };
+        store
+            .append_turn(
+                &[Message::User {
+                    content: "ok".into(),
+                }],
+                1,
+                &usage,
+            )
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{broken-json\n")
+            .unwrap();
+        let restored = store.restore("system").unwrap();
+        assert_eq!(restored.context.messages().len(), 1);
+        assert_eq!(restored.next_turn_id, 2);
+        let _ = std::fs::remove_file(path);
+    }
+}
