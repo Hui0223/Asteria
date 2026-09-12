@@ -36,6 +36,22 @@ impl DeepSeekProvider {
 
     /// 执行一次 DeepSeek HTTP 请求并解析为统一助手消息。
     async fn request(&self, context: &PreparedContext, tools: Value) -> Result<AssistantTurn> {
+        let (tools, tool_choice) = if context.force_calculation() {
+            let calculate_only = tools
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|item| item["function"]["name"] == "calculate")
+                        .cloned()
+                        .collect()
+                })
+                .map(Value::Array)
+                .unwrap_or(tools);
+            (calculate_only, json!("required"))
+        } else {
+            (tools, json!("auto"))
+        };
         let response: ChatResponse = self
             .client
             .post(&self.api_url)
@@ -44,7 +60,7 @@ impl DeepSeekProvider {
                 "model": self.model,
                 "messages": project(context),
                 "tools": tools,
-                "tool_choice": "auto",
+                "tool_choice": tool_choice,
                 "thinking": {"type": "disabled"}
             }))
             .send()
