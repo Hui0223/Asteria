@@ -135,9 +135,11 @@ impl EventSink for TuiEventSink {
                 turn_id,
                 call_id,
                 is_error,
+                duration_ms,
             } => format!(
-                "[Event][Turn {turn_id}] tool result: {call_id} status={}",
-                if is_error { "error" } else { "ok" }
+                "[Event][Turn {turn_id}] tool result: {call_id} status={} duration={}ms",
+                if is_error { "error" } else { "ok" },
+                duration_ms
             ),
             AgentEvent::PermissionRequested {
                 turn_id,

@@ -17,6 +17,7 @@ pub struct ToolExecutionResult {
     pub index: usize,
     pub call_id: String,
     pub output: ToolOutput,
+    pub duration_ms: u128,
 }
 
 /// 工具执行时携带的运行上下文。
@@ -204,21 +205,24 @@ impl ToolRegistry {
         for (index, call) in calls.iter().enumerate() {
             let call_id = call.id.clone();
             pending.push(async move {
+                let started = std::time::Instant::now();
+                let output = self
+                    .execute_call(
+                        &call.name,
+                        &call.arguments,
+                        Some(&call.id),
+                        ToolExecutionContext {
+                            turn_id,
+                            call_id: call.id.clone(),
+                            cancel: cancel.clone(),
+                        },
+                    )
+                    .await;
                 ToolExecutionResult {
                     index,
                     call_id,
-                    output: self
-                        .execute_call(
-                            &call.name,
-                            &call.arguments,
-                            Some(&call.id),
-                            ToolExecutionContext {
-                                turn_id,
-                                call_id: call.id.clone(),
-                                cancel: cancel.clone(),
-                            },
-                        )
-                        .await,
+                    output,
+                    duration_ms: started.elapsed().as_millis(),
                 }
             });
         }

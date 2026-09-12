@@ -25,6 +25,7 @@ pub enum AgentEvent {
         turn_id: u64,
         call_id: String,
         is_error: bool,
+        duration_ms: u128,
     },
     /// 工具权限为 ask，正在等待用户批准。
     PermissionRequested {

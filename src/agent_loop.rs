@@ -337,21 +337,24 @@ impl<P: ModelProvider> AgentLoop<P> {
                         bail!("当前 Turn 已取消");
                     }
             };
-            let mut outputs: HashMap<String, tools::ToolOutput> = results
+            let mut outputs: HashMap<String, (tools::ToolOutput, u128)> = results
                 .into_iter()
-                .map(|result| (result.call_id, result.output))
+                .map(|result| (result.call_id, (result.output, result.duration_ms)))
                 .collect();
             for call in calls {
-                let output = outputs
-                    .remove(&call.id)
-                    .unwrap_or_else(|| tools::ToolOutput {
-                        content: if duplicate_ids.contains(&call.id) {
-                            "工具执行失败: 当前 Turn 已重复调用相同工具和参数".into()
-                        } else {
-                            "工具执行失败: 缺少工具结果".into()
+                let (output, duration_ms) = outputs.remove(&call.id).unwrap_or_else(|| {
+                    (
+                        tools::ToolOutput {
+                            content: if duplicate_ids.contains(&call.id) {
+                                "工具执行失败: 当前 Turn 已重复调用相同工具和参数".into()
+                            } else {
+                                "工具执行失败: 缺少工具结果".into()
+                            },
+                            is_error: true,
                         },
-                        is_error: true,
-                    });
+                        0,
+                    )
+                });
                 let call_id = call.id;
                 let is_error = output.is_error;
                 context.append_tool_result(call_id.clone(), output.content, is_error)?;
@@ -368,6 +371,7 @@ impl<P: ModelProvider> AgentLoop<P> {
                     turn_id,
                     call_id,
                     is_error,
+                    duration_ms,
                 });
             }
             self.transition(TurnState::Running);
