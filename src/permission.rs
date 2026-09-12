@@ -6,7 +6,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 /// 单个工具在当前会话中的权限；新注册工具默认需要人工确认。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ToolPermission {
     Allow,
     Deny,

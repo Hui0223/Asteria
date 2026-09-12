@@ -1,4 +1,6 @@
-use crate::{context::ContextMemory, message::Message, provider::TokenUsage};
+use crate::{
+    context::ContextMemory, message::Message, permission::ToolPermission, provider::TokenUsage,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,8 +13,17 @@ use std::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum SessionEvent {
-    Message { message: Message },
-    TurnCompleted { turn_id: u64, usage: TokenUsage },
+    Message {
+        message: Message,
+    },
+    TurnCompleted {
+        turn_id: u64,
+        usage: TokenUsage,
+    },
+    PermissionChanged {
+        tool: String,
+        permission: ToolPermission,
+    },
 }
 
 /// 管理单个 Asteria 会话的 JSONL 追加日志和恢复状态。
@@ -25,6 +36,7 @@ pub struct RestoredSession {
     pub context: ContextMemory,
     pub next_turn_id: u64,
     pub usage: TokenUsage,
+    pub permissions: Vec<(String, ToolPermission)>,
 }
 
 impl SessionStore {
@@ -45,6 +57,7 @@ impl SessionStore {
         let mut pending_messages = Vec::new();
         let mut next_turn_id = 1;
         let mut usage = TokenUsage::default();
+        let mut permissions = Vec::new();
         let file = match File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -52,6 +65,7 @@ impl SessionStore {
                     context: ContextMemory::new(system_prompt),
                     next_turn_id,
                     usage,
+                    permissions: Vec::new(),
                 });
             }
             Err(error) => return Err(error.into()),
@@ -73,13 +87,34 @@ impl SessionStore {
                     usage.completion_tokens += turn_usage.completion_tokens;
                     usage.total_tokens += turn_usage.total_tokens;
                 }
+                SessionEvent::PermissionChanged { tool, permission } => {
+                    permissions.push((tool, permission))
+                }
             }
         }
         Ok(RestoredSession {
             context: ContextMemory::restore(system_prompt, messages)?,
             next_turn_id,
             usage,
+            permissions,
         })
+    }
+
+    /// 追加当前会话的一条工具权限变更。
+    pub fn append_permission(&self, tool: &str, permission: ToolPermission) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        write_event(
+            &mut file,
+            &SessionEvent::PermissionChanged {
+                tool: tool.into(),
+                permission,
+            },
+        )?;
+        file.sync_data()?;
+        Ok(())
     }
 
     /// 追加一批完整消息和 Turn 元数据，并在每条事件写入后刷新文件。

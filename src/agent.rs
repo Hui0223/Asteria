@@ -23,6 +23,9 @@ impl Asteria {
         let restored = session.restore(SYSTEM)?;
         let mut agent_loop = AgentLoop::new(DeepSeekProvider::from_env()?, LoopConfig::default());
         agent_loop.restore_session_state(restored.next_turn_id, restored.usage);
+        for (tool, permission) in restored.permissions {
+            agent_loop.set_tool_permission(&tool, permission).ok();
+        }
         Ok(Self {
             agent_loop,
             context: restored.context,
@@ -56,7 +59,8 @@ impl Asteria {
         name: &str,
         permission: crate::permission::ToolPermission,
     ) -> Result<()> {
-        self.agent_loop.set_tool_permission(name, permission)
+        self.agent_loop.set_tool_permission(name, permission)?;
+        self.session.append_permission(name, permission)
     }
 
     /// 获取工具权限列表。
