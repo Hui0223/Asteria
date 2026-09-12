@@ -42,6 +42,7 @@ impl SessionStore {
     /// 读取历史事件并重建 ContextMemory；损坏的最后一行会被忽略。
     pub fn restore(&self, system_prompt: &str) -> Result<RestoredSession> {
         let mut messages = Vec::new();
+        let mut pending_messages = Vec::new();
         let mut next_turn_id = 1;
         let mut usage = TokenUsage::default();
         let file = match File::open(&self.path) {
@@ -61,11 +62,12 @@ impl SessionStore {
                 continue;
             };
             match event {
-                SessionEvent::Message { message } => messages.push(message),
+                SessionEvent::Message { message } => pending_messages.push(message),
                 SessionEvent::TurnCompleted {
                     turn_id,
                     usage: turn_usage,
                 } => {
+                    messages.append(&mut pending_messages);
                     next_turn_id = next_turn_id.max(turn_id + 1);
                     usage.prompt_tokens += turn_usage.prompt_tokens;
                     usage.completion_tokens += turn_usage.completion_tokens;
