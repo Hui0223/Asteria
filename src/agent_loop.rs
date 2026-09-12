@@ -300,6 +300,15 @@ impl<P: ModelProvider> AgentLoop<P> {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
                 });
+                if self.tool_registry.permission(&call.name)
+                    == Some(crate::permission::ToolPermission::Ask)
+                {
+                    self.event_sink.publish(AgentEvent::PermissionRequested {
+                        turn_id,
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                    });
+                }
                 let key = format!("{}:{}", call.name, call.arguments);
                 if self.tool_call_keys.insert(key) {
                     runnable.push(call.clone());
@@ -332,6 +341,15 @@ impl<P: ModelProvider> AgentLoop<P> {
                 let call_id = call.id;
                 let is_error = output.is_error;
                 context.append_tool_result(call_id.clone(), output.content, is_error)?;
+                if self.tool_registry.permission(&call.name)
+                    == Some(crate::permission::ToolPermission::Ask)
+                {
+                    self.event_sink.publish(AgentEvent::PermissionResolved {
+                        turn_id,
+                        call_id: call_id.clone(),
+                        allowed: !is_error,
+                    });
+                }
                 self.event_sink.publish(AgentEvent::ToolResult {
                     turn_id,
                     call_id,

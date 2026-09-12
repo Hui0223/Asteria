@@ -84,6 +84,11 @@ impl ToolRegistry {
         entries
     }
 
+    /// 返回工具当前权限，供 Loop 在等待审批前发布事件。
+    pub fn permission(&self, name: &str) -> Option<ToolPermission> {
+        self.permissions.get(name).copied()
+    }
+
     /// 注入异步审批处理器；没有处理器时 ask 自动拒绝。
     pub fn set_approver(&mut self, approver: Arc<dyn ToolApprover>) {
         self.approver = Some(approver);

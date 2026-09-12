@@ -21,6 +21,18 @@ pub enum AgentEvent {
         call_id: String,
         is_error: bool,
     },
+    /// 工具权限为 ask，正在等待用户批准。
+    PermissionRequested {
+        turn_id: u64,
+        call_id: String,
+        name: String,
+    },
+    /// 用户对本次工具调用作出批准或拒绝。
+    PermissionResolved {
+        turn_id: u64,
+        call_id: String,
+        allowed: bool,
+    },
     StepCompleted {
         turn_id: u64,
         step: usize,

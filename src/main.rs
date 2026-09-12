@@ -132,6 +132,23 @@ impl EventSink for TuiEventSink {
                 "[Event][Turn {turn_id}] tool result: {call_id} status={}",
                 if is_error { "error" } else { "ok" }
             ),
+            AgentEvent::PermissionRequested {
+                turn_id,
+                call_id,
+                name,
+            } => {
+                format!("[Event][Turn {turn_id}] permission requested: {name} ({call_id})")
+            }
+            AgentEvent::PermissionResolved {
+                turn_id,
+                call_id,
+                allowed,
+            } => {
+                format!(
+                    "[Event][Turn {turn_id}] permission {}: {call_id}",
+                    if allowed { "approved" } else { "denied" }
+                )
+            }
             AgentEvent::StepCompleted {
                 turn_id,
                 step,
