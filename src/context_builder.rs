@@ -78,6 +78,7 @@ pub struct PreparedContext {
     messages: Vec<Message>,
     estimated_tokens: usize,
     truncated: bool,
+    force_calculation: bool,
 }
 
 impl PreparedContext {
@@ -104,6 +105,11 @@ impl PreparedContext {
     /// 表示本次视图是否省略了较早的完整 Turn。
     pub fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// 表示当前用户问题是否应强制使用 calculate 工具。
+    pub fn force_calculation(&self) -> bool {
+        self.force_calculation
     }
 }
 
@@ -139,6 +145,7 @@ impl<E: TokenEstimator> ContextBuilder<E> {
                 messages: memory.messages().to_vec(),
                 estimated_tokens: all_tokens,
                 truncated: false,
+                force_calculation: latest_requires_calculation(memory.messages()),
             });
         }
 
@@ -149,6 +156,7 @@ impl<E: TokenEstimator> ContextBuilder<E> {
                 messages: Vec::new(),
                 estimated_tokens: base_tokens,
                 truncated: false,
+                force_calculation: latest_requires_calculation(memory.messages()),
             });
         };
         let current_tokens = self.estimate_messages(&memory.messages()[current_start..current_end]);
@@ -189,6 +197,7 @@ impl<E: TokenEstimator> ContextBuilder<E> {
             messages: memory.messages()[first_message..].to_vec(),
             estimated_tokens: selected_tokens,
             truncated: first_message > 0,
+            force_calculation: latest_requires_calculation(memory.messages()),
         })
     }
 
@@ -228,6 +237,35 @@ impl<E: TokenEstimator> ContextBuilder<E> {
             + self.estimate_text(&call.name)
             + self.estimate_text(&call.arguments)
     }
+}
+
+/// 用轻量规则识别明确的数学请求，避免把普通聊天错误强制成工具调用。
+fn latest_requires_calculation(messages: &[Message]) -> bool {
+    let Some(user_index) = messages
+        .iter()
+        .rposition(|message| matches!(message, Message::User { .. }))
+    else {
+        return false;
+    };
+    // 工具结果已经回写后，当前 Step 允许模型生成最终文本。
+    if messages[user_index + 1..]
+        .iter()
+        .any(|message| matches!(message, Message::Tool { .. }))
+    {
+        return false;
+    }
+    let Message::User { content } = &messages[user_index] else {
+        return false;
+    };
+    let has_math_marker = content.contains("计算")
+        || content.contains("算出")
+        || content.contains("求")
+        || content.contains("calculate");
+    let has_operator = content
+        .chars()
+        .any(|character| "+-*/^×÷=".contains(character))
+        && content.chars().any(|character| character.is_ascii_digit());
+    has_math_marker && has_operator
 }
 
 /// 为被省略的旧消息生成不依赖模型的保守摘要，避免摘要过程递归调用模型。
@@ -480,5 +518,27 @@ mod tests {
         assert!(prepared.estimated_tokens() > 20);
         assert!(!prepared.truncated());
         assert_eq!(prepared.messages(), memory.messages());
+    }
+
+    #[test]
+    /// 验证明确数学请求触发代码级 calculate 强制策略。
+    fn detects_calculation_request() {
+        let mut memory = ContextMemory::new("system");
+        memory.append_user("计算 1+1").unwrap();
+        let prepared = ContextBuilder::new(ContextPolicy::default(), CharacterEstimator)
+            .prepare(&memory, &json!([]))
+            .unwrap();
+        assert!(prepared.force_calculation());
+    }
+
+    #[test]
+    /// 普通对话即使包含数字也不应被错误强制调用计算工具。
+    fn does_not_force_calculation_for_normal_chat() {
+        let mut memory = ContextMemory::new("system");
+        memory.append_user("我有 1 个问题，今天心情很好").unwrap();
+        let prepared = ContextBuilder::new(ContextPolicy::default(), CharacterEstimator)
+            .prepare(&memory, &json!([]))
+            .unwrap();
+        assert!(!prepared.force_calculation());
     }
 }
