@@ -6,6 +6,7 @@ use approval_ui::ApprovalUi;
 use asteria_agent::{
     agent::Asteria,
     agent_loop::{CancelToken, TurnState},
+    events::{AgentEvent, EventSink},
     permission::ChannelApprover,
 };
 use std::collections::VecDeque;
@@ -22,6 +23,9 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::start()?;
     let retry_output = terminal.output.clone();
     agent.set_retry_output(move |message| retry_output.print(message));
+    agent.set_event_sink(std::sync::Arc::new(TuiEventSink {
+        output: terminal.output.clone(),
+    }));
     terminal.output.print(format!(
         "Asteria · {}  (/context 查看记忆，/usage 查看统计，/reset 清空记忆，/exit 退出；Ctrl+C 或 /cancel 取消当前轮)",
         agent.model()
@@ -98,6 +102,64 @@ async fn main() -> Result<()> {
     }
     terminal.finish();
     Ok(())
+}
+
+/// 将结构化 AgentEvent 转换成清晰的 TUI 事件日志。
+struct TuiEventSink {
+    output: Output,
+}
+
+impl EventSink for TuiEventSink {
+    /// 将事件交给 Reedline 外部输出通道，避免破坏当前输入行。
+    fn publish(&self, event: AgentEvent) {
+        let line = match event {
+            AgentEvent::TurnStarted { turn_id, input } => {
+                format!("[Event][Turn {turn_id}] started: {}", preview(&input))
+            }
+            AgentEvent::StepStarted { turn_id, step } => {
+                format!("[Event][Turn {turn_id}][Step {step}] started")
+            }
+            AgentEvent::ToolCallStarted {
+                turn_id,
+                call_id,
+                name,
+            } => format!("[Event][Turn {turn_id}] tool started: {name} ({call_id})"),
+            AgentEvent::ToolResult {
+                turn_id,
+                call_id,
+                is_error,
+            } => format!(
+                "[Event][Turn {turn_id}] tool result: {call_id} status={}",
+                if is_error { "error" } else { "ok" }
+            ),
+            AgentEvent::StepCompleted {
+                turn_id,
+                step,
+                usage,
+            } => format!(
+                "[Event][Turn {turn_id}][Step {step}] completed: tokens={}",
+                usage.total_tokens
+            ),
+            AgentEvent::TurnCompleted { turn_id, steps } => {
+                format!("[Event][Turn {turn_id}] completed: steps={steps}")
+            }
+            AgentEvent::TurnCancelled { turn_id } => format!("[Event][Turn {turn_id}] cancelled"),
+            AgentEvent::TurnFailed { turn_id, message } => {
+                format!("[Event][Turn {turn_id}] failed: {message}")
+            }
+        };
+        self.output.print(line);
+    }
+}
+
+/// 压缩事件中的用户输入，避免长问题淹没 TUI。
+fn preview(input: &str) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut result = compact.chars().take(120).collect::<String>();
+    if compact.chars().count() > 120 {
+        result.push('…');
+    }
+    result
 }
 
 /// 同时等待回答、输入与取消；普通输入排队，取消后等待回滚完成。
