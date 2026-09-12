@@ -257,6 +257,27 @@ fn validate_arguments(schema: Value, raw_args: &str) -> Result<(), String> {
             }
         }
     }
+    if let Some(properties) = schema["function"]["parameters"]["properties"].as_object() {
+        for (field, definition) in properties {
+            let Some(value) = args.get(field) else {
+                continue;
+            };
+            if let Some(expected) = definition["type"].as_str() {
+                let valid = match expected {
+                    "string" => value.is_string(),
+                    "number" => value.is_number(),
+                    "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+                    "boolean" => value.is_boolean(),
+                    "object" => value.is_object(),
+                    "array" => value.is_array(),
+                    _ => true,
+                };
+                if !valid {
+                    return Err(format!("{field} 参数必须是 {expected}"));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -645,5 +666,17 @@ mod tests {
         assert!(!results[1].output.is_error);
         assert_eq!(results[1].output.content, calls[1].arguments);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    /// 验证 Schema 类型错误会在权限和工具执行之前被拒绝。
+    async fn schema_validation_checks_value_types() {
+        let registry = ToolRegistry::default();
+        let output = registry.execute("calculate", r#"{"expression":123}"#).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("expression 参数必须是 string"));
+        let output = registry.execute("wait_for", r#"{"seconds":"5"}"#).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("seconds 参数必须是 number"));
     }
 }
