@@ -1,4 +1,9 @@
 use crate::provider::TokenUsage;
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{self, SyncSender},
+};
+use std::thread::JoinHandle;
 
 /// Asteria 执行过程中的稳定事件类型，供 TUI、Transcript、日志和评估使用。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -85,6 +90,59 @@ impl EventSink for FanoutEventSink {
     fn publish(&self, event: AgentEvent) {
         for sink in &self.sinks {
             sink.publish(event.clone());
+        }
+    }
+}
+
+/// 有界异步事件队列；生产者只入队，磁盘和 TUI 输出由后台消费者处理。
+pub struct QueuedEventSink {
+    sender: Mutex<Option<SyncSender<AgentEvent>>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl QueuedEventSink {
+    /// 创建容量受限的事件队列，并启动一个后台消费线程。
+    pub fn new(sinks: Vec<Arc<dyn EventSink>>) -> Arc<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<AgentEvent>(1024);
+        let worker = std::thread::Builder::new()
+            .name("asteria-events".into())
+            .spawn(move || {
+                while let Ok(event) = receiver.recv() {
+                    for sink in &sinks {
+                        sink.publish(event.clone());
+                    }
+                }
+            })
+            .expect("无法启动事件消费线程");
+        Arc::new(Self {
+            sender: Mutex::new(Some(sender)),
+            worker: Mutex::new(Some(worker)),
+        })
+    }
+}
+
+impl EventSink for QueuedEventSink {
+    /// 非阻塞发布事件；队列满时丢弃事件，避免拖住 Agent 主循环。
+    fn publish(&self, event: AgentEvent) {
+        let sender = self
+            .sender
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        if let Some(sender) = sender {
+            let _ = sender.try_send(event);
+        }
+    }
+}
+
+impl Drop for QueuedEventSink {
+    /// 关闭发送端并等待队列中的事件消费完成。
+    fn drop(&mut self) {
+        self.sender.lock().ok().and_then(|mut sender| sender.take());
+        if let Ok(mut worker) = self.worker.lock()
+            && let Some(worker) = worker.take()
+        {
+            let _ = worker.join();
         }
     }
 }

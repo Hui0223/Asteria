@@ -1,6 +1,7 @@
 use crate::{
     agent_loop::{AgentLoop, CancelToken, LoopConfig, TurnReport},
     context::ContextMemory,
+    events::QueuedEventSink,
     provider::TokenUsage,
     provider::deepseek::DeepSeekProvider,
     session::SessionStore,
@@ -23,7 +24,8 @@ impl Asteria {
         let restored = session.restore(SYSTEM)?;
         let mut agent_loop = AgentLoop::new(DeepSeekProvider::from_env()?, LoopConfig::default());
         agent_loop.restore_session_state(restored.next_turn_id, restored.usage);
-        agent_loop.set_event_sink(std::sync::Arc::new(session.event_sink()));
+        let persistent_events = std::sync::Arc::new(session.event_sink());
+        agent_loop.set_event_sink(QueuedEventSink::new(vec![persistent_events]));
         for (tool, permission) in restored.permissions {
             agent_loop.set_tool_permission(&tool, permission).ok();
         }
