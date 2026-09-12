@@ -1,5 +1,9 @@
 use crate::{
-    context::ContextMemory, message::Message, permission::ToolPermission, provider::TokenUsage,
+    context::ContextMemory,
+    events::{AgentEvent, EventSink},
+    message::Message,
+    permission::ToolPermission,
+    provider::TokenUsage,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -24,9 +28,13 @@ enum SessionEvent {
         tool: String,
         permission: ToolPermission,
     },
+    AgentEvent {
+        event: AgentEvent,
+    },
 }
 
 /// 管理单个 Asteria 会话的 JSONL 追加日志和恢复状态。
+#[derive(Clone)]
 pub struct SessionStore {
     path: PathBuf,
 }
@@ -90,6 +98,7 @@ impl SessionStore {
                 SessionEvent::PermissionChanged { tool, permission } => {
                     permissions.push((tool, permission))
                 }
+                SessionEvent::AgentEvent { .. } => {}
             }
         }
         Ok(RestoredSession {
@@ -115,6 +124,29 @@ impl SessionStore {
         )?;
         file.sync_data()?;
         Ok(())
+    }
+
+    /// 将一次 AgentEvent 追加到 JSONL，供审计和 Transcript 使用。
+    pub fn append_agent_event(&self, event: &AgentEvent) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        write_event(
+            &mut file,
+            &SessionEvent::AgentEvent {
+                event: event.clone(),
+            },
+        )?;
+        file.sync_data()?;
+        Ok(())
+    }
+
+    /// 创建将事件写入该会话文件的 EventSink。
+    pub fn event_sink(self: &std::sync::Arc<Self>) -> PersistentEventSink {
+        PersistentEventSink {
+            store: self.clone(),
+        }
     }
 
     /// 追加一批完整消息和 Turn 元数据，并在每条事件写入后刷新文件。
@@ -161,6 +193,20 @@ impl SessionStore {
     /// 返回当前日志路径，便于诊断显示。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// 将执行事件写入 SessionStore 的持久化接收器。
+pub struct PersistentEventSink {
+    store: std::sync::Arc<SessionStore>,
+}
+
+impl EventSink for PersistentEventSink {
+    /// 事件持久化失败只记录错误，不阻断当前 Turn。
+    fn publish(&self, event: AgentEvent) {
+        if let Err(error) = self.store.append_agent_event(&event) {
+            eprintln!("事件持久化失败: {error:#}");
+        }
     }
 }
 

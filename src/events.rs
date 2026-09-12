@@ -1,7 +1,7 @@
 use crate::provider::TokenUsage;
 
 /// Asteria 执行过程中的稳定事件类型，供 TUI、Transcript、日志和评估使用。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentEvent {
     TurnStarted {
         turn_id: u64,
@@ -73,4 +73,18 @@ pub struct NoopEventSink;
 impl EventSink for NoopEventSink {
     /// 丢弃事件。
     fn publish(&self, _: AgentEvent) {}
+}
+
+/// 将同一事件同时发送给持久化、TUI 或评估等多个接收器。
+pub struct FanoutEventSink {
+    pub sinks: Vec<std::sync::Arc<dyn EventSink>>,
+}
+
+impl EventSink for FanoutEventSink {
+    /// 顺序通知所有接收器。
+    fn publish(&self, event: AgentEvent) {
+        for sink in &self.sinks {
+            sink.publish(event.clone());
+        }
+    }
 }

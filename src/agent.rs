@@ -13,16 +13,17 @@ const SYSTEM: &str = "你是 Asteria，一个可靠、简洁的中文 AI 助手�
 pub struct Asteria {
     agent_loop: AgentLoop<DeepSeekProvider>,
     context: ContextMemory,
-    session: SessionStore,
+    session: std::sync::Arc<SessionStore>,
 }
 
 impl Asteria {
     /// 根据环境变量创建 DeepSeek Agent，并采用默认 Loop 配置。
     pub fn new() -> Result<Self> {
-        let session = SessionStore::from_env()?;
+        let session = std::sync::Arc::new(SessionStore::from_env()?);
         let restored = session.restore(SYSTEM)?;
         let mut agent_loop = AgentLoop::new(DeepSeekProvider::from_env()?, LoopConfig::default());
         agent_loop.restore_session_state(restored.next_turn_id, restored.usage);
+        agent_loop.set_event_sink(std::sync::Arc::new(session.event_sink()));
         for (tool, permission) in restored.permissions {
             agent_loop.set_tool_permission(&tool, permission).ok();
         }
