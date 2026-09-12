@@ -108,6 +108,15 @@ impl ToolRegistry {
     async fn execute_call(&self, name: &str, raw_args: &str, call_id: Option<&str>) -> ToolOutput {
         let output = match self.tools.get(name) {
             Some(tool) => {
+                if let Err(error) = validate_arguments(tool.schema(), raw_args) {
+                    return truncate_output(
+                        ToolOutput {
+                            content: format!("工具执行失败: 参数校验失败: {error}"),
+                            is_error: true,
+                        },
+                        self.max_output_chars,
+                    );
+                }
                 let allowed = match self.permissions.get(name).copied().unwrap_or_default() {
                     ToolPermission::Allow => true,
                     ToolPermission::Deny => false,
@@ -183,6 +192,22 @@ impl ToolRegistry {
             ..Self::default()
         }
     }
+}
+
+/// 按工具 Schema 做最小通用校验，确保错误参数不会触发审批或执行副作用。
+fn validate_arguments(schema: Value, raw_args: &str) -> Result<(), String> {
+    let args: Value = serde_json::from_str(raw_args).map_err(|error| error.to_string())?;
+    if !args.is_object() {
+        return Err("参数必须是 JSON 对象".into());
+    }
+    if let Some(required) = schema["function"]["parameters"]["required"].as_array() {
+        for field in required.iter().filter_map(Value::as_str) {
+            if args.get(field).is_none() || args[field].is_null() {
+                return Err(format!("缺少 {field} 参数"));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Default for ToolRegistry {
@@ -455,7 +480,7 @@ mod tests {
         }
         /// 返回最小测试 Schema。
         fn schema(&self) -> Value {
-            json!({"type":"function","function":{"name":"counted","parameters":{"type":"object"}}})
+            json!({"type":"function","function":{"name":"counted","parameters":{"type":"object","required":["value"]}}})
         }
         /// 计数增加即表示工具真实启动。
         async fn execute(&self, args: &str) -> ToolOutput {
@@ -473,22 +498,34 @@ mod tests {
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut registry = ToolRegistry::new();
         registry.register(CountedTool(count.clone()));
-        assert!(registry.execute("counted", "{}").await.is_error);
+        assert!(registry.execute("counted", r#"{"value":1}"#).await.is_error);
         registry
             .set_permission("counted", ToolPermission::Deny)
             .unwrap();
-        assert!(registry.execute("counted", "{}").await.is_error);
+        assert!(registry.execute("counted", r#"{"value":1}"#).await.is_error);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
         registry
             .set_permission("counted", ToolPermission::Allow)
             .unwrap();
-        assert!(!registry.execute("counted", "{}").await.is_error);
+        assert!(!registry.execute("counted", r#"{"value":1}"#).await.is_error);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(
             registry
                 .set_permission("missing", ToolPermission::Allow)
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    /// 参数不完整时在权限检查前失败，工具执行次数保持为零。
+    async fn schema_validation_precedes_permission_and_execution() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register_with_permission(CountedTool(count.clone()), ToolPermission::Ask);
+        let output = registry.execute("counted", "{}").await;
+        assert!(output.is_error);
+        assert!(output.content.contains("缺少 value 参数"));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -502,11 +539,11 @@ mod tests {
         let (approver, mut requests) = ChannelApprover::channel();
         registry.set_approver(Arc::new(approver));
         for (id, allowed) in [(1, true), (2, false)] {
-            let (output, ()) = tokio::join!(registry.execute("counted", "{}"), async {
+            let (output, ()) = tokio::join!(registry.execute("counted", r#"{"value":1}"#), async {
                 let request = requests.recv().await.unwrap();
                 assert_eq!(request.id, id);
                 assert_eq!(request.tool_name, "counted");
-                assert_eq!(request.arguments, "{}");
+                assert_eq!(request.arguments, r#"{"value":1}"#);
                 assert_eq!(count.load(Ordering::SeqCst), usize::from(id == 2));
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 request.reply.send(allowed).unwrap();
@@ -515,7 +552,7 @@ mod tests {
             assert_eq!(count.load(Ordering::SeqCst), 1);
         }
         drop(requests);
-        assert!(registry.execute("counted", "{}").await.is_error);
+        assert!(registry.execute("counted", r#"{"value":1}"#).await.is_error);
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
