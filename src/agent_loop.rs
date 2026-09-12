@@ -331,7 +331,7 @@ impl<P: ModelProvider> AgentLoop<P> {
                 }
             }
             let results = tokio::select! {
-                results = self.tool_registry.execute_batch(&runnable) => results,
+                results = self.tool_registry.execute_batch(&runnable, turn_id, cancel) => results,
                     _ = cancel.cancelled() => {
                         self.transition(TurnState::Cancelled);
                         bail!("当前 Turn 已取消");

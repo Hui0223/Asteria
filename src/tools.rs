@@ -1,3 +1,4 @@
+use crate::agent_loop::CancelToken;
 use crate::permission::{ToolApprover, ToolPermission};
 use chrono::Local;
 use serde_json::{Value, json};
@@ -18,6 +19,14 @@ pub struct ToolExecutionResult {
     pub output: ToolOutput,
 }
 
+/// 工具执行时携带的运行上下文。
+#[derive(Clone)]
+pub struct ToolExecutionContext {
+    pub turn_id: u64,
+    pub call_id: String,
+    pub cancel: CancelToken,
+}
+
 /// 定义一个可被模型发现和调用的工具。
 #[async_trait::async_trait]
 pub trait AgentTool: Send + Sync {
@@ -27,6 +36,15 @@ pub trait AgentTool: Send + Sync {
     fn schema(&self) -> Value;
     /// 校验原始 JSON 参数并执行工具。
     async fn execute(&self, raw_args: &str) -> ToolOutput;
+
+    /// 带上下文的执行入口；默认兼容旧工具实现。
+    async fn execute_with_context(
+        &self,
+        raw_args: &str,
+        _context: ToolExecutionContext,
+    ) -> ToolOutput {
+        self.execute(raw_args).await
+    }
 }
 
 /// 保存工具实例，并负责 Schema 汇总和按名称分发。
@@ -101,11 +119,27 @@ impl ToolRegistry {
 
     /// 按模型给出的名称执行工具；未知名称返回结构化错误。
     pub async fn execute(&self, name: &str, raw_args: &str) -> ToolOutput {
-        self.execute_call(name, raw_args, None).await
+        self.execute_call(
+            name,
+            raw_args,
+            None,
+            ToolExecutionContext {
+                turn_id: 0,
+                call_id: String::new(),
+                cancel: CancelToken::new(),
+            },
+        )
+        .await
     }
 
     /// 权限通过后才创建工具执行 Future、开始执行计时；拒绝也返回配对工具结果。
-    async fn execute_call(&self, name: &str, raw_args: &str, call_id: Option<&str>) -> ToolOutput {
+    async fn execute_call(
+        &self,
+        name: &str,
+        raw_args: &str,
+        call_id: Option<&str>,
+        context: ToolExecutionContext,
+    ) -> ToolOutput {
         let output = match self.tools.get(name) {
             Some(tool) => {
                 if let Err(error) = validate_arguments(tool.schema(), raw_args) {
@@ -134,7 +168,12 @@ impl ToolRegistry {
                         self.max_output_chars,
                     );
                 }
-                match tokio::time::timeout(self.max_execution_time, tool.execute(raw_args)).await {
+                match tokio::time::timeout(
+                    self.max_execution_time,
+                    tool.execute_with_context(raw_args, context),
+                )
+                .await
+                {
                     Ok(output) => output,
                     Err(_) => ToolOutput {
                         content: format!(
@@ -157,6 +196,8 @@ impl ToolRegistry {
     pub async fn execute_batch(
         &self,
         calls: &[crate::message::ToolCall],
+        turn_id: u64,
+        cancel: &CancelToken,
     ) -> Vec<ToolExecutionResult> {
         use futures::{StreamExt, stream::FuturesUnordered};
         let pending = FuturesUnordered::new();
@@ -167,7 +208,16 @@ impl ToolRegistry {
                     index,
                     call_id,
                     output: self
-                        .execute_call(&call.name, &call.arguments, Some(&call.id))
+                        .execute_call(
+                            &call.name,
+                            &call.arguments,
+                            Some(&call.id),
+                            ToolExecutionContext {
+                                turn_id,
+                                call_id: call.id.clone(),
+                                cancel: cancel.clone(),
+                            },
+                        )
                         .await,
                 }
             });
@@ -577,7 +627,8 @@ mod tests {
                 arguments: "{\"value\":2}".into(),
             },
         ];
-        let (results, ()) = tokio::join!(registry.execute_batch(&calls), async {
+        let batch_cancel = CancelToken::new();
+        let (results, ()) = tokio::join!(registry.execute_batch(&calls, 1, &batch_cancel), async {
             let a = requests.recv().await.unwrap();
             let b = requests.recv().await.unwrap();
             assert_ne!(a.id, b.id);
