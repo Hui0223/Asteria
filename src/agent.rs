@@ -87,6 +87,19 @@ impl Asteria {
         &self.context
     }
 
+    /// 返回当前 JSONL 会话文件路径。
+    pub fn session_path(&self) -> &std::path::Path {
+        self.session.path()
+    }
+
+    /// 创建新的空会话，同时清空内存、持久化记录和累计 Token。
+    pub fn new_session(&mut self) -> Result<()> {
+        self.context.reset();
+        self.session.clear()?;
+        self.agent_loop.reset_session_state();
+        Ok(())
+    }
+
     /// 清空对话历史，但保留 Agent 的系统设定。
     pub fn reset(&mut self) {
         self.context.reset();

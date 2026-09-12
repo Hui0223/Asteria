@@ -12,6 +12,8 @@ cargo run --release
 
 输入 `/context` 查看原始记忆，`/usage` 查看最近 Turn 与会话累计用量，`/reset` 清空记忆（保留用量统计），`/exit` 退出。
 
+会话命令：`/session` 显示当前 JSONL 文件路径；`/new-session` 清空当前会话、重置 Turn 编号和 Session Token 统计，开始一个全新的会话。
+
 会话默认持久化到 `.asteria/session.jsonl`，也可以通过 `ASTERIA_SESSION_PATH` 指定路径。成功完成的 Turn 会写入 User、Assistant、Tool 消息和 Token Usage；启动时按完成标记重放。失败或取消的 Turn 不会写入，半写入的未完成批次会被忽略。
 
 用于测试工具取消和超时：输入“请调用 wait_for 工具等待 60 秒”，等待期间输入 `/cancel` 并回车。`wait_for` 是专用测试工具，只等待，不进行系统操作；参数范围为 1～120 秒，工具默认超时为 30 秒。

@@ -68,6 +68,13 @@ async fn main() -> Result<()> {
             "/cancel" => terminal.output.print("当前没有运行中的 Turn。"),
             "/context" => print_context(&agent, &terminal.output),
             "/usage" => print_usage(&agent, &terminal.output),
+            "/session" => terminal
+                .output
+                .print(format!("[Session] {}", agent.session_path().display())),
+            "/new-session" => match agent.new_session() {
+                Ok(()) => terminal.output.print("[Session] 已创建新的空会话。"),
+                Err(error) => terminal.output.print(format!("创建新会话失败: {error:#}")),
+            },
             "/reset" => {
                 agent.reset();
                 terminal.output.print("Asteria: 记忆已清空。");

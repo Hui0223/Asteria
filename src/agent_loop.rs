@@ -151,6 +151,14 @@ impl<P: ModelProvider> AgentLoop<P> {
         self.session_usage = usage;
     }
 
+    /// 开始新会话，清空 Turn 编号和 Session Token 累计，但不影响模型配置。
+    pub fn reset_session_state(&mut self) {
+        self.next_turn_id = 1;
+        self.last_turn = None;
+        self.session_usage = TokenUsage::default();
+        self.tool_call_keys.clear();
+    }
+
     /// 异步执行 Turn；取消请发信号并等待本方法结束，以完成回滚，勿直接丢弃此 Future。
     pub async fn run_turn(
         &mut self,
