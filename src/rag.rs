@@ -204,28 +204,42 @@ fn split_document(
     chunks
 }
 
-/// 将中英文文本归一化为小写词集合，当前使用轻量词法检索。
+/// 将英文按词、中文按连续双字词归一化，避免单个汉字造成误命中。
 fn terms(text: &str) -> HashSet<String> {
     let mut result = HashSet::new();
     let mut ascii = String::new();
+    let mut cjk = String::new();
     let flush = |result: &mut HashSet<String>, ascii: &mut String| {
         if !ascii.is_empty() {
             result.insert(ascii.to_lowercase());
             ascii.clear();
         }
     };
+    let flush_cjk = |result: &mut HashSet<String>, cjk: &mut String| {
+        let chars: Vec<char> = cjk.chars().collect();
+        for window in chars.windows(2) {
+            result.insert(window.iter().collect());
+        }
+        cjk.clear();
+    };
     for character in text.chars() {
         if character.is_ascii_alphanumeric() {
+            flush_cjk(&mut result, &mut cjk);
             ascii.push(character);
         } else {
             flush(&mut result, &mut ascii);
-            if !character.is_whitespace() && !"，。！？、：；（）()[]{}<>\"'".contains(character)
+            if character.is_alphanumeric()
+                && !character.is_whitespace()
+                && !"，。！？、：；（）()[]{}<>\"'".contains(character)
             {
-                result.insert(character.to_string());
+                cjk.push(character);
+            } else {
+                flush_cjk(&mut result, &mut cjk);
             }
         }
     }
     flush(&mut result, &mut ascii);
+    flush_cjk(&mut result, &mut cjk);
     result
 }
 
@@ -293,6 +307,15 @@ mod tests {
                 .build_prompt("quantum banana", 2)
                 .contains("没有检索到相关本地资料")
         );
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    /// 防止共享单个汉字导致完全无关的问题误命中文档。
+    fn avoids_false_positive_from_single_chinese_characters() {
+        let path = fixture();
+        let store = RagStore::from_dir(&path, 200, 0).unwrap();
+        assert!(store.search("量子计算机和火星移民", 3).is_empty());
         let _ = fs::remove_dir_all(path);
     }
 }
