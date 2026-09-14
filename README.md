@@ -8,9 +8,11 @@ RAG 检索器位于 `src/rag.rs`，先读取本地 UTF-8 文档、按字符切�
 
 ```bash
 cargo run --bin asteria-rag -- docs/rag-demo "Context Kernel"
+# 检索后调用 DeepSeek 生成答案（需要 .env 中的 API Key）
+cargo run --bin asteria-rag -- --generate docs/rag-demo "Context Kernel 是什么？"
 ```
 
-该命令会打印知识库片段数量、来源、匹配分数和最终增强 Prompt；它展示的是 RAG 的 Retrieval 和 Augmentation 两步。接入 DeepSeek 生成最终答案可以把打印出的 Prompt 传给 Asteria。
+默认命令会打印知识库片段数量、来源、匹配分数和增强 Prompt；它展示 RAG 的 Retrieval 和 Augmentation。加上 `--generate` 后，增强 Prompt 会自动交给 Asteria/DeepSeek，完成 Generation。
 
 ## 运行
 
