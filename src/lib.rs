@@ -8,6 +8,7 @@ pub mod events;
 pub mod message;
 pub mod permission;
 pub mod provider;
+pub mod rag;
 pub mod retry;
 pub mod session;
 pub mod tools;
