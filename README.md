@@ -2,6 +2,16 @@
 
 一个 Rust 命令行 Agent，使用 DeepSeek，支持多轮对话、工具调用、上下文预算与摘要、请求重试和 Token 统计。
 
+## 本地 RAG 示例
+
+RAG 检索器位于 `src/rag.rs`，先读取本地 UTF-8 文档、按字符切分，再用轻量关键词重合度排序相关片段，最后组装带来源的增强 Prompt。它不依赖向量数据库或 API Key，可以直接本地运行：
+
+```bash
+cargo run --bin asteria-rag -- docs/rag-demo "Context Kernel"
+```
+
+该命令会打印知识库片段数量、来源、匹配分数和最终增强 Prompt；它展示的是 RAG 的 Retrieval 和 Augmentation 两步。接入 DeepSeek 生成最终答案可以把打印出的 Prompt 传给 Asteria。
+
 ## 运行
 
 ```bash

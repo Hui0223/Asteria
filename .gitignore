@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 target/
 .asteria/
+.DS_Store
