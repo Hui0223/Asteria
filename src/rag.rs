@@ -112,7 +112,8 @@ impl RagStore {
             .filter_map(|chunk| {
                 let chunk_terms = terms(&chunk.text);
                 let score = query_terms.intersection(&chunk_terms).count();
-                (score > 0).then(|| SearchResult {
+                // 低于 3 分的片段通常只是共享少量常见词，不足以作为回答依据。
+                (score >= 3).then(|| SearchResult {
                     chunk: chunk.clone(),
                     score,
                 })
@@ -280,8 +281,8 @@ mod tests {
     fn ranks_matching_chunks() {
         let path = fixture();
         let store = RagStore::from_dir(&path, 200, 0).unwrap();
-        let results = store.search("Context Kernel", 1);
-        assert_eq!(results[0].score, 2);
+        let results = store.search("Asteria Context Kernel", 1);
+        assert_eq!(results[0].score, 3);
         assert!(results[0].chunk.text.contains("Context Kernel"));
         let _ = fs::remove_dir_all(path);
     }
@@ -291,7 +292,7 @@ mod tests {
     fn builds_grounded_prompt() {
         let path = fixture();
         let store = RagStore::from_dir(&path, 200, 0).unwrap();
-        let prompt = store.build_prompt("Context Kernel 是什么？", 2);
+        let prompt = store.build_prompt("Asteria Context Kernel 是什么？", 2);
         assert!(prompt.contains("guide.md"));
         assert!(prompt.contains("Context Kernel 是什么？"));
         let _ = fs::remove_dir_all(path);
