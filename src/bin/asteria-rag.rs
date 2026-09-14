@@ -61,8 +61,23 @@ async fn main() -> Result<()> {
 
 /// 为单个问题检索资料、调用 Asteria 并打印最终答案。
 async fn answer_query(store: &RagStore, agent: &mut Asteria, question: &str) -> Result<()> {
+    let results = store.search(question, 3);
+    if results.is_empty() {
+        println!("\n[RAG 检索] 没有命中相关资料，Agent 将被要求明确说明资料不足。");
+    } else {
+        println!("\n[RAG 检索] 命中 {} 个资料片段：", results.len());
+        for (index, result) in results.iter().enumerate() {
+            println!(
+                "  {}. {} · 片段 {} · 匹配分数 {}",
+                index + 1,
+                result.chunk.source.display(),
+                result.chunk.index,
+                result.score
+            );
+        }
+    }
     let prompt = store.build_prompt(question, 3);
     let answer = agent.ask(&prompt).await?;
-    println!("\nAsteria RAG: {answer}");
+    println!("\n=== Asteria RAG 回答 ===\n{answer}");
     Ok(())
 }
