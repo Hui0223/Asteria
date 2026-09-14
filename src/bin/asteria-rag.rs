@@ -5,6 +5,8 @@ use std::env;
 /// 运行本地 RAG 检索示例，可选地调用 DeepSeek 生成最终答案。
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 独立二进制不会经过主 CLI，因此需要自行加载项目根目录的 .env。
+    dotenvy::dotenv().ok();
     let mut args = env::args().skip(1);
     let generate = args.next().as_deref() == Some("--generate");
     if !generate {
