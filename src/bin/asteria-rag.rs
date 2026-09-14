@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use asteria_agent::{agent::Asteria, rag::RagStore};
 use std::env;
 
@@ -12,13 +12,23 @@ async fn main() -> Result<()> {
     if !generate {
         args = env::args().skip(1);
     }
-    let dir = args.next().unwrap_or_else(|| "docs/rag-demo".into());
+    let first = args.next().unwrap_or_else(|| "docs/rag-demo".into());
+    let remote = first == "--url";
+    let source = if remote {
+        args.next().context("--url 后缺少 URL")?
+    } else {
+        first
+    };
     let query = args.collect::<Vec<_>>().join(" ");
     if query.trim().is_empty() {
-        eprintln!("用法：cargo run --bin asteria-rag -- <文档目录> <问题>");
+        eprintln!("用法：cargo run --bin asteria-rag -- [--generate] [--url URL|文档目录] <问题>");
         return Ok(());
     }
-    let store = RagStore::from_dir(&dir, 500, 50)?;
+    let store = if remote {
+        RagStore::from_urls(&[source], 500, 50).await?
+    } else {
+        RagStore::from_dir(&source, 500, 50)?
+    };
     let prompt = store.build_prompt(&query, 3);
     println!("知识库片段数：{}\n\n增强 Prompt：\n{}", store.len(), prompt);
     if generate {

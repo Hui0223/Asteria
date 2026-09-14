@@ -46,6 +46,53 @@ impl RagStore {
         Ok(Self { chunks })
     }
 
+    /// 从 HTTP/HTTPS URL 下载 UTF-8 文本并切分，单个响应最多 2 MiB。
+    pub async fn from_urls(
+        urls: &[String],
+        chunk_chars: usize,
+        overlap_chars: usize,
+    ) -> Result<Self> {
+        if chunk_chars == 0 || overlap_chars >= chunk_chars {
+            bail!("chunk_chars 必须大于 overlap_chars，且不能为 0");
+        }
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        let mut chunks = Vec::new();
+        for url in urls {
+            let response = client
+                .get(url)
+                .send()
+                .await
+                .with_context(|| format!("无法访问远端文档 {url}"))?
+                .error_for_status()
+                .with_context(|| format!("远端文档返回错误 {url}"))?;
+            if response
+                .content_length()
+                .is_some_and(|length| length > 2 * 1024 * 1024)
+            {
+                bail!("远端文档超过 2 MiB 限制: {url}");
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .with_context(|| format!("无法读取远端文档 {url}"))?;
+            if bytes.len() > 2 * 1024 * 1024 {
+                bail!("远端文档超过 2 MiB 限制: {url}");
+            }
+            let text = std::str::from_utf8(&bytes)
+                .with_context(|| format!("远端文档不是 UTF-8 文本 {url}"))?;
+            chunks.extend(split_document(
+                Path::new(url),
+                text,
+                chunk_chars,
+                overlap_chars,
+            ));
+        }
+        Ok(Self { chunks })
+    }
+
     /// 返回知识库中的片段数量。
     pub fn len(&self) -> usize {
         self.chunks.len()
