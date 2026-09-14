@@ -31,12 +31,14 @@ impl RetryPolicy {
 
 /// 仅重试限流、服务端错误、超时及明确的临时网络 I/O 错误。
 pub fn is_retryable(error: &anyhow::Error) -> bool {
-    if let Some(http) = error.downcast_ref::<reqwest::Error>() {
-        if let Some(status) = http.status() {
-            return status.as_u16() == 429 || status.is_server_error();
-        }
-        if http.is_timeout() {
-            return true;
+    for cause in error.chain() {
+        if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some(status) = http.status() {
+                return status.as_u16() == 429 || status.is_server_error();
+            }
+            if http.is_timeout() {
+                return true;
+            }
         }
     }
     error

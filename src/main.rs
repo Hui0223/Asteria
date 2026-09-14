@@ -27,16 +27,18 @@ async fn main() -> Result<()> {
         output: terminal.output.clone(),
     }));
     terminal.output.print(format!(
-        "Asteria · {}  (/context 查看记忆，/usage 查看统计，/reset 清空记忆，/exit 退出；Ctrl+C 或 /cancel 取消当前轮)",
+        "=== Asteria 已启动 ===\n模型：{}\n命令：/context 记忆 | /usage 用量 | /reset 清空 | /exit 退出\n取消：Ctrl+C 或 /cancel",
         agent.model()
     ));
-    terminal.output.print("工具权限：/permissions 查看；/permission <工具名> allow|deny|ask 设置。待批准时使用 /approve <编号> 或 /deny <编号>。");
+    terminal.output.print(
+        "工具权限：/permissions 查看；/permission <工具名> allow|deny|ask 设置；待批准时使用 /approve <编号> 或 /deny <编号>。",
+    );
     let mut queued: VecDeque<String> = VecDeque::new();
     loop {
         let input = if let Some(line) = queued.pop_front() {
             terminal
                 .output
-                .print(format!("[开始处理排队输入] {:?}", line.trim()));
+                .print(format!("--- 开始处理排队问题 ---\n用户：{}", line.trim()));
             line
         } else {
             tokio::select! {
@@ -90,7 +92,9 @@ async fn main() -> Result<()> {
                 )
                 .await
                 {
-                    Ok(answer) => terminal.output.print(format!("Asteria: {answer}")),
+                    Ok(answer) => terminal
+                        .output
+                        .print(format!("=== Asteria 回答 ===\n{answer}")),
                     Err(_)
                         if agent
                             .last_turn()
@@ -98,9 +102,11 @@ async fn main() -> Result<()> {
                     {
                         terminal
                             .output
-                            .print("Asteria: 当前 Turn 已取消，可继续提问。");
+                            .print("=== Turn 已取消 ===\n当前问题没有完成，可以继续提问。");
                     }
-                    Err(error) => terminal.output.print(format!("错误: {error:#}")),
+                    Err(error) => terminal
+                        .output
+                        .print(format!("=== 执行失败 ===\n原因：{error:#}")),
                 }
                 approvals.clear();
                 print_usage(&agent, &terminal.output);
@@ -121,24 +127,24 @@ impl EventSink for TuiEventSink {
     fn publish(&self, event: AgentEvent) {
         let line = match event {
             AgentEvent::TurnStarted { turn_id, input } => {
-                format!("[Event][Turn {turn_id}] started: {}", preview(&input))
+                format!("[执行] Turn {turn_id} 开始\n用户：{}", preview(&input))
             }
             AgentEvent::StepStarted { turn_id, step } => {
-                format!("[Event][Turn {turn_id}][Step {step}] started")
+                format!("[执行] Turn {turn_id} · Step {step}\n动作：请求模型")
             }
             AgentEvent::ToolCallStarted {
                 turn_id,
                 call_id,
                 name,
-            } => format!("[Event][Turn {turn_id}] tool started: {name} ({call_id})"),
+            } => format!("[工具] Turn {turn_id} 开始调用\n工具：{name}\n调用：{call_id}"),
             AgentEvent::ToolResult {
                 turn_id,
                 call_id,
                 is_error,
                 duration_ms,
             } => format!(
-                "[Event][Turn {turn_id}] tool result: {call_id} status={} duration={}ms",
-                if is_error { "error" } else { "ok" },
+                "[工具] Turn {turn_id} 调用结束\n调用：{call_id}\n结果：{} · 耗时：{}ms",
+                if is_error { "失败" } else { "成功" },
                 duration_ms
             ),
             AgentEvent::PermissionRequested {
@@ -146,7 +152,7 @@ impl EventSink for TuiEventSink {
                 call_id,
                 name,
             } => {
-                format!("[Event][Turn {turn_id}] permission requested: {name} ({call_id})")
+                format!("[权限] Turn {turn_id} 等待确认\n工具：{name}\n调用：{call_id}")
             }
             AgentEvent::PermissionResolved {
                 turn_id,
@@ -154,8 +160,8 @@ impl EventSink for TuiEventSink {
                 allowed,
             } => {
                 format!(
-                    "[Event][Turn {turn_id}] permission {}: {call_id}",
-                    if allowed { "approved" } else { "denied" }
+                    "[权限] Turn {turn_id} {}\n调用：{call_id}",
+                    if allowed { "已批准" } else { "已拒绝" }
                 )
             }
             AgentEvent::StepCompleted {
@@ -163,7 +169,7 @@ impl EventSink for TuiEventSink {
                 step,
                 usage,
             } => format!(
-                "[Event][Turn {turn_id}][Step {step}] completed: tokens={}",
+                "[执行] Turn {turn_id} · Step {step} 完成\n本次 Token：{}",
                 usage.total_tokens
             ),
             AgentEvent::StepRetrying {
@@ -174,14 +180,14 @@ impl EventSink for TuiEventSink {
                 max_attempts,
                 delay_ms,
             } => format!(
-                "[Event][Turn {turn_id}][Step {step}] retrying: attempt {failed_attempt} failed, next={next_attempt}/{max_attempts}, delay={delay_ms}ms"
+                "[重试] Turn {turn_id} · Step {step}\n第 {failed_attempt} 次失败，准备第 {next_attempt}/{max_attempts} 次\n等待：{delay_ms}ms"
             ),
             AgentEvent::TurnCompleted { turn_id, steps } => {
-                format!("[Event][Turn {turn_id}] completed: steps={steps}")
+                format!("[完成] Turn {turn_id}\n共执行：{steps} 个 Step")
             }
-            AgentEvent::TurnCancelled { turn_id } => format!("[Event][Turn {turn_id}] cancelled"),
+            AgentEvent::TurnCancelled { turn_id } => format!("[取消] Turn {turn_id}\n状态：已取消"),
             AgentEvent::TurnFailed { turn_id, message } => {
-                format!("[Event][Turn {turn_id}] failed: {message}")
+                format!("[失败] Turn {turn_id}\n原因：{message}")
             }
         };
         self.output.print(line);
@@ -208,7 +214,7 @@ async fn ask_interruptible(
 ) -> Result<String> {
     terminal
         .output
-        .print("[处理中] 可继续输入并回车排队，或输入 /cancel 取消当前轮。");
+        .print("--- 正在处理 ---\n可以继续输入并回车排队；输入 /cancel 或按 Ctrl+C 取消当前轮。");
     let cancel = CancelToken::new();
     let request = agent.ask_with_cancel(input, &cancel);
     tokio::pin!(request);
@@ -218,7 +224,7 @@ async fn ask_interruptible(
         tokio::select! {
             biased;
             signal = tokio::signal::ctrl_c() => {
-                terminal.output.print("[Cancel] 收到 Ctrl+C，正在取消当前 Turn。");
+                terminal.output.print("[取消] 收到 Ctrl+C，正在取消当前 Turn。");
                 cancel.cancel();
                 let result = request.await;
                 signal.context("无法监听 Ctrl+C")?;
@@ -234,12 +240,12 @@ async fn ask_interruptible(
             event = terminal.input.recv(), if input_open => {
                 match event {
                     Some(InputEvent::Cancel) => {
-                        terminal.output.print("[Cancel] 收到 Ctrl+C，正在取消当前 Turn。");
+                        terminal.output.print("[取消] 收到 Ctrl+C，正在取消当前 Turn。");
                         cancel.cancel();
                         return request.await;
                     }
                     Some(InputEvent::Line(line)) if line.trim() == "/cancel" => {
-                        terminal.output.print("[Cancel] 收到 /cancel，正在取消当前 Turn。");
+                        terminal.output.print("[取消] 收到 /cancel，正在取消当前 Turn。");
                         cancel.cancel();
                         return request.await;
                     }
@@ -312,7 +318,7 @@ fn print_usage(agent: &Asteria, output: &Output) {
     let mut lines = Vec::new();
     if let Some(turn) = agent.last_turn() {
         lines.push(format!(
-            "[Turn {}] state={:?} steps={} retries={} context_messages={}",
+            "=== 最近一次 Turn：{} ===\n状态：{:?} · 步骤：{} · 重试：{}\n上下文消息：{}",
             turn.id,
             turn.state,
             turn.steps,
@@ -320,7 +326,7 @@ fn print_usage(agent: &Asteria, output: &Output) {
             agent.context().messages().len()
         ));
         lines.push(format!(
-            "[Turn Token Usage] input={} output={} total={}",
+            "本轮用量：输入 {} · 输出 {} · 合计 {}",
             turn.usage.prompt_tokens, turn.usage.completion_tokens, turn.usage.total_tokens
         ));
     } else {
@@ -328,9 +334,10 @@ fn print_usage(agent: &Asteria, output: &Output) {
     }
     let usage = agent.session_usage();
     lines.push(format!(
-        "[Session Token Usage] input={} output={} total={}",
+        "=== 当前会话累计用量 ===\n输入 {} · 输出 {} · 合计 {}",
         usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
     ));
-    lines.push("用量仅累计已收到的 usage；未返回的用量未知。/reset 不清空累计。".into());
+    lines
+        .push("说明：只累计模型实际返回的 usage；未返回的用量未知。/reset 不清空累计用量。".into());
     output.print(lines.join("\n"));
 }
