@@ -113,8 +113,9 @@ impl RagStore {
             .filter_map(|chunk| {
                 let chunk_terms = terms(&chunk.text);
                 let score = query_terms.intersection(&chunk_terms).count();
-                // 长问题需要更多重合词，短问题仍保留最低分数保护。
-                (score >= minimum_score).then(|| SearchResult {
+                let coverage_ok = score * 5 >= query_terms.len();
+                // 同时要求最低分和至少 20% 的查询词命中，减少长问题误召回。
+                (score >= minimum_score && coverage_ok).then(|| SearchResult {
                     chunk: chunk.clone(),
                     score,
                 })
@@ -184,32 +185,35 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// 按字符边界切分文档，并保留相邻片段的重叠内容。
+/// 优先按 Markdown 段落切分文档，再对过长段落按字符切分。
 fn split_document(
     source: &Path,
     text: &str,
     chunk_chars: usize,
     overlap_chars: usize,
 ) -> Vec<Chunk> {
-    let chars: Vec<char> = text.chars().collect();
     let mut chunks = Vec::new();
-    let mut start = 0;
     let mut index = 0;
-    while start < chars.len() {
-        let end = (start + chunk_chars).min(chars.len());
-        let text: String = chars[start..end].iter().collect();
-        if !text.trim().is_empty() {
+    for section in text
+        .split("\n\n")
+        .filter(|section| !section.trim().is_empty())
+    {
+        let chars: Vec<char> = section.chars().collect();
+        let mut start = 0;
+        while start < chars.len() {
+            let end = (start + chunk_chars).min(chars.len());
+            let text: String = chars[start..end].iter().collect();
             chunks.push(Chunk {
                 source: source.to_owned(),
                 index,
                 text,
             });
             index += 1;
+            if end == chars.len() {
+                break;
+            }
+            start = end - overlap_chars;
         }
-        if end == chars.len() {
-            break;
-        }
-        start = end - overlap_chars;
     }
     chunks
 }
