@@ -6,7 +6,7 @@ use std::{
 };
 
 /// 一段可被检索并注入 Prompt 的本地文档片段。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Chunk {
     pub source: PathBuf,
     pub index: usize,
@@ -26,6 +26,27 @@ pub struct RagStore {
 }
 
 impl RagStore {
+    /// 将已切分的知识库保存为 JSON，供下次启动快速恢复。
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_vec_pretty(&self.chunks)?;
+        fs::write(path, data).with_context(|| format!("无法保存 RAG 缓存 {}", path.display()))?;
+        Ok(())
+    }
+
+    /// 从 JSON 恢复已切分的知识库；损坏缓存会返回明确错误。
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let data =
+            fs::read(path).with_context(|| format!("无法读取 RAG 缓存 {}", path.display()))?;
+        let chunks = serde_json::from_slice(&data)
+            .with_context(|| format!("RAG 缓存格式无效 {}", path.display()))?;
+        Ok(Self { chunks })
+    }
+
     /// 从目录递归读取 UTF-8 文本文件并切分成片段。
     pub fn from_dir(
         path: impl AsRef<Path>,

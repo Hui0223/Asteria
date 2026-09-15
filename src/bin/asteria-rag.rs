@@ -22,9 +22,15 @@ async fn main() -> Result<()> {
     } else {
         first
     };
+    let is_default_source = !remote && source == "docs/rag-demo";
     let query = args.collect::<Vec<_>>().join(" ");
+    let cache = std::path::Path::new(".asteria/rag-cache.json");
     let store = if remote {
-        RagStore::from_urls(&[source], 500, 50).await?
+        let store = RagStore::from_urls(&[source], 500, 50).await?;
+        store.save(cache)?;
+        store
+    } else if is_default_source && cache.exists() {
+        RagStore::load(cache).or_else(|_| RagStore::from_dir(&source, 500, 50))?
     } else {
         RagStore::from_dir(&source, 500, 50)?
     };
