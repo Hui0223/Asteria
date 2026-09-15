@@ -106,14 +106,15 @@ impl RagStore {
     /// 按查询词与片段词的重合数量排序，返回最多 top_k 条结果。
     pub fn search(&self, query: &str, top_k: usize) -> Vec<SearchResult> {
         let query_terms = terms(query);
+        let minimum_score = minimum_relevance_score(query_terms.len());
         let mut results: Vec<_> = self
             .chunks
             .iter()
             .filter_map(|chunk| {
                 let chunk_terms = terms(&chunk.text);
                 let score = query_terms.intersection(&chunk_terms).count();
-                // 低于 3 分的片段通常只是共享少量常见词，不足以作为回答依据。
-                (score >= 3).then(|| SearchResult {
+                // 长问题需要更多重合词，短问题仍保留最低分数保护。
+                (score >= minimum_score).then(|| SearchResult {
                     chunk: chunk.clone(),
                     score,
                 })
@@ -154,6 +155,14 @@ impl RagStore {
             "请只根据下面的本地资料回答问题；资料不足时明确说不知道。\n\n本地资料：\n{context}\n\n问题：{query}"
         )
     }
+}
+
+/// 根据查询关键词数量计算最低相关分数，避免固定阈值造成召回失衡。
+fn minimum_relevance_score(term_count: usize) -> usize {
+    if term_count == 0 {
+        return usize::MAX;
+    }
+    3.max(term_count.div_ceil(6))
 }
 
 /// 递归收集文本文件，跳过隐藏文件和目录。
@@ -318,5 +327,14 @@ mod tests {
         let store = RagStore::from_dir(&path, 200, 0).unwrap();
         assert!(store.search("量子计算机和火星移民", 3).is_empty());
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    /// 长问题需要更高的关键词重合度，避免少量词命中无关片段。
+    fn raises_threshold_for_long_queries() {
+        assert_eq!(minimum_relevance_score(3), 3);
+        assert_eq!(minimum_relevance_score(18), 3);
+        assert_eq!(minimum_relevance_score(24), 4);
+        assert_eq!(minimum_relevance_score(0), usize::MAX);
     }
 }
