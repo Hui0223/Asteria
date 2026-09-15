@@ -184,6 +184,9 @@ fn minimum_relevance_score(term_count: usize) -> usize {
     if term_count == 0 {
         return usize::MAX;
     }
+    if term_count <= 2 {
+        return 1;
+    }
     3.max(term_count.div_ceil(6))
 }
 
@@ -366,6 +369,8 @@ mod tests {
     #[test]
     /// 长问题需要更高的关键词重合度，避免少量词命中无关片段。
     fn raises_threshold_for_long_queries() {
+        assert_eq!(minimum_relevance_score(1), 1);
+        assert_eq!(minimum_relevance_score(2), 1);
         assert_eq!(minimum_relevance_score(3), 3);
         assert_eq!(minimum_relevance_score(18), 3);
         assert_eq!(minimum_relevance_score(24), 4);
