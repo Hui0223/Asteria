@@ -254,7 +254,16 @@ fn terms(text: &str) -> HashSet<String> {
     }
     flush(&mut result, &mut ascii);
     flush_cjk(&mut result, &mut cjk);
+    result.retain(|term| !is_query_stopword(term));
     result
+}
+
+/// 移除中文疑问句中的功能词，避免句式影响文档相关性评分。
+fn is_query_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "有没有" | "是否" | "介绍" | "什么" | "如何" | "怎么" | "请问" | "以及" | "可以" | "能够"
+    )
 }
 
 #[cfg(test)]
@@ -340,5 +349,15 @@ mod tests {
         assert_eq!(minimum_relevance_score(18), 3);
         assert_eq!(minimum_relevance_score(24), 4);
         assert_eq!(minimum_relevance_score(0), usize::MAX);
+    }
+
+    #[test]
+    /// 疑问句功能词不应参与文档相关性评分。
+    fn ignores_question_stopwords() {
+        let path = fixture();
+        let store = RagStore::from_dir(&path, 200, 0).unwrap();
+        let results = store.search("Asteria 有没有介绍 Context Kernel？", 1);
+        assert_eq!(results[0].score, 3);
+        let _ = fs::remove_dir_all(path);
     }
 }
