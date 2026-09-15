@@ -184,7 +184,7 @@ fn minimum_relevance_score(term_count: usize) -> usize {
     if term_count == 0 {
         return usize::MAX;
     }
-    if term_count <= 2 {
+    if term_count <= 4 {
         return 1;
     }
     3.max(term_count.div_ceil(6))
@@ -285,7 +285,7 @@ fn terms(text: &str) -> HashSet<String> {
 
 /// 删除常见口语问法，让有效主题词不会被无意义的跨词组合干扰。
 fn remove_query_phrases(text: &str) -> String {
-    ["有啥", "有哪些", "有什么", "能做什么", "能干什么"]
+    ["有啥", "有哪些", "有什么", "能做什么", "能干什么", "介绍"]
         .into_iter()
         .fold(text.to_owned(), |text, phrase| text.replace(phrase, " "))
 }
@@ -379,7 +379,7 @@ mod tests {
     fn raises_threshold_for_long_queries() {
         assert_eq!(minimum_relevance_score(1), 1);
         assert_eq!(minimum_relevance_score(2), 1);
-        assert_eq!(minimum_relevance_score(3), 3);
+        assert_eq!(minimum_relevance_score(3), 1);
         assert_eq!(minimum_relevance_score(18), 3);
         assert_eq!(minimum_relevance_score(24), 4);
         assert_eq!(minimum_relevance_score(0), usize::MAX);
@@ -401,6 +401,15 @@ mod tests {
         let path = fixture();
         let store = RagStore::from_dir(&path, 200, 0).unwrap();
         assert!(!store.search("Asteria有啥功能", 1).is_empty());
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    /// 自然中文短问句应能命中主题词，而不会被固定阈值过滤。
+    fn handles_natural_feature_question() {
+        let path = fixture();
+        let store = RagStore::from_dir(&path, 200, 0).unwrap();
+        assert!(!store.search("介绍Asteria基本功能", 1).is_empty());
         let _ = fs::remove_dir_all(path);
     }
 }
