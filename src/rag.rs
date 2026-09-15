@@ -244,6 +244,7 @@ fn split_document(
 
 /// 将英文按词、中文按连续双字词归一化，避免单个汉字造成误命中。
 fn terms(text: &str) -> HashSet<String> {
+    let normalized = remove_query_phrases(text);
     let mut result = HashSet::new();
     let mut ascii = String::new();
     let mut cjk = String::new();
@@ -260,7 +261,7 @@ fn terms(text: &str) -> HashSet<String> {
         }
         cjk.clear();
     };
-    for character in text.chars() {
+    for character in normalized.chars() {
         if character.is_ascii_alphanumeric() {
             flush_cjk(&mut result, &mut cjk);
             ascii.push(character);
@@ -280,6 +281,13 @@ fn terms(text: &str) -> HashSet<String> {
     flush_cjk(&mut result, &mut cjk);
     result.retain(|term| !is_query_stopword(term));
     result
+}
+
+/// 删除常见口语问法，让有效主题词不会被无意义的跨词组合干扰。
+fn remove_query_phrases(text: &str) -> String {
+    ["有啥", "有哪些", "有什么", "能做什么", "能干什么"]
+        .into_iter()
+        .fold(text.to_owned(), |text, phrase| text.replace(phrase, " "))
 }
 
 /// 移除中文疑问句中的功能词，避免句式影响文档相关性评分。
@@ -384,6 +392,15 @@ mod tests {
         let store = RagStore::from_dir(&path, 200, 0).unwrap();
         let results = store.search("Asteria 有没有介绍 Context Kernel？", 1);
         assert_eq!(results[0].score, 3);
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    /// 口语化短问题仍应命中文档中的核心主题词。
+    fn handles_informal_short_queries() {
+        let path = fixture();
+        let store = RagStore::from_dir(&path, 200, 0).unwrap();
+        assert!(!store.search("Asteria有啥功能", 1).is_empty());
         let _ = fs::remove_dir_all(path);
     }
 }
