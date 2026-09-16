@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
+use quick_xml::events::Event;
 use std::{
     collections::HashSet,
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -60,8 +62,7 @@ impl RagStore {
         collect_files(path.as_ref(), &mut files)?;
         let mut chunks = Vec::new();
         for file in files {
-            let text = fs::read_to_string(&file)
-                .with_context(|| format!("无法读取 {}", file.display()))?;
+            let text = read_document_text(&file)?;
             chunks.extend(split_document(&file, &text, chunk_chars, overlap_chars));
         }
         Ok(Self { chunks })
@@ -181,6 +182,40 @@ impl RagStore {
         format!(
             "请只根据下面的本地资料回答问题；资料不足时明确说不知道。\n\n本地资料：\n{context}\n\n问题：{query}"
         )
+    }
+}
+
+/// 读取普通文本或 Word 文档；DOCX 只提取 XML 中的文字，自动跳过图片二进制内容。
+fn read_document_text(path: &Path) -> Result<String> {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("docx"))
+    {
+        let file = fs::File::open(path).with_context(|| format!("无法打开 {}", path.display()))?;
+        let mut archive = zip::ZipArchive::new(file)
+            .with_context(|| format!("不是有效的 DOCX 文件 {}", path.display()))?;
+        let mut xml = String::new();
+        archive
+            .by_name("word/document.xml")
+            .with_context(|| format!("DOCX 缺少正文 {}", path.display()))?
+            .read_to_string(&mut xml)?;
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        let mut text = String::new();
+        loop {
+            match reader.read_event()? {
+                Event::Text(value) => text.push_str(&value.unescape()?),
+                Event::End(value)
+                    if value.name().as_ref() == b"p" || value.name().as_ref() == b"tc" =>
+                {
+                    text.push('\n')
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        Ok(text)
+    } else {
+        fs::read_to_string(path).with_context(|| format!("无法读取 {}", path.display()))
     }
 }
 
