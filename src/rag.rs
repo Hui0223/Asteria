@@ -227,10 +227,15 @@ fn read_document_text(path: &Path) -> Result<String> {
         loop {
             match reader.read_event()? {
                 Event::Text(value) => text.push_str(&value.unescape()?),
-                Event::End(value)
-                    if value.name().as_ref() == b"p" || value.name().as_ref() == b"tc" =>
-                {
-                    text.push('\n')
+                Event::End(value) => {
+                    let name = value.name();
+                    if is_docx_tag(name.as_ref(), b"p") {
+                        text.push_str("\n\n");
+                    } else if is_docx_tag(name.as_ref(), b"tc") {
+                        text.push_str(" | ");
+                    } else if is_docx_tag(name.as_ref(), b"tr") {
+                        text.push('\n');
+                    }
                 }
                 Event::Eof => break,
                 _ => {}
@@ -240,6 +245,14 @@ fn read_document_text(path: &Path) -> Result<String> {
     } else {
         fs::read_to_string(path).with_context(|| format!("无法读取 {}", path.display()))
     }
+}
+
+/// 判断带命名空间前缀的 DOCX XML 标签，例如 `w:p` 或 `w:tc`。
+fn is_docx_tag(name: &[u8], local_name: &[u8]) -> bool {
+    name == local_name
+        || name
+            .strip_prefix(b"w:")
+            .is_some_and(|name| name == local_name)
 }
 
 /// 计算 BM25：稀有词权重更高，词频递增受限，长片段会被长度修正。
@@ -506,5 +519,14 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].score, 0);
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    /// 段落分隔应保留，避免结构化文档被拼成一整段。
+    fn preserves_paragraph_boundaries() {
+        let chunks = split_document(Path::new("guide.md"), "第一段\n\n第二段", 100, 0);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].text, "第一段");
+        assert_eq!(chunks[1].text, "第二段");
     }
 }
