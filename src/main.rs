@@ -8,6 +8,7 @@ use asteria_agent::{
     agent_loop::{CancelToken, TurnState},
     events::{AgentEvent, EventSink},
     permission::ChannelApprover,
+    rag::RagStore,
 };
 use std::collections::VecDeque;
 use terminal::{InputEvent, Output, Terminal};
@@ -17,6 +18,7 @@ use terminal::{InputEvent, Output, Terminal};
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let mut agent = Asteria::new()?;
+    let rag_store = load_default_rag_store()?;
     let (approver, requests) = ChannelApprover::channel();
     agent.set_tool_approver(std::sync::Arc::new(approver));
     let mut approvals = ApprovalUi::new(requests);
@@ -33,6 +35,16 @@ async fn main() -> Result<()> {
     terminal.output.print(
         "工具权限：/permissions 查看；/permission <工具名> allow|deny|ask 设置；待批准时使用 /approve <编号> 或 /deny <编号>。",
     );
+    if let Some(store) = &rag_store {
+        terminal.output.print(format!(
+            "知识库：已加载 {} 个片段（来源：docs/rag-docs）。命中时自动检索。",
+            store.len()
+        ));
+    } else {
+        terminal.output.print(
+            "知识库：未加载。将使用普通 Agent 对话。若要启用 RAG，请把文档放入 docs/rag-docs。",
+        );
+    }
     let mut queued: VecDeque<String> = VecDeque::new();
     loop {
         let input = if let Some(line) = queued.pop_front() {
@@ -83,9 +95,10 @@ async fn main() -> Result<()> {
             }
             "" => {}
             text => {
+                let rag_input = prepare_rag_input(rag_store.as_ref(), text, &terminal.output);
                 match ask_interruptible(
                     &mut agent,
-                    text,
+                    &rag_input,
                     &mut terminal,
                     &mut queued,
                     &mut approvals,
@@ -115,6 +128,44 @@ async fn main() -> Result<()> {
     }
     terminal.finish();
     Ok(())
+}
+
+/// 加载主 TUI 默认使用的本地 RAG 文档目录。
+fn load_default_rag_store() -> Result<Option<RagStore>> {
+    let path = std::path::Path::new("docs/rag-docs");
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(RagStore::from_dir(path, 500, 50)?))
+}
+
+/// 根据当前用户输入检索文档；没有命中时保留普通 Agent 对话。
+fn prepare_rag_input(store: Option<&RagStore>, question: &str, output: &Output) -> String {
+    let Some(store) = store else {
+        return question.to_owned();
+    };
+    let results = store.search(question, 3);
+    if results.is_empty() {
+        output.print("[RAG 检索] 当前问题没有命中文档，继续使用普通 Agent 对话。");
+        return question.to_owned();
+    }
+    output.print(format!(
+        "[RAG 检索] 命中 {} 个片段：\n{}",
+        results.len(),
+        results
+            .iter()
+            .enumerate()
+            .map(|(index, result)| format!(
+                "  {}. {} · 片段 {} · BM25 {}",
+                index + 1,
+                result.chunk.source.display(),
+                result.chunk.index,
+                result.score
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ));
+    store.build_prompt(question, 3)
 }
 
 /// 将结构化 AgentEvent 转换成清晰的 TUI 事件日志。
