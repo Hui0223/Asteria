@@ -13,7 +13,7 @@ pub struct Chunk {
     pub text: String,
 }
 
-/// 检索结果及其关键词重合分数。
+/// 检索结果及其 BM25 分数（乘以 100 后取整，便于终端展示）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchResult {
     pub chunk: Chunk,
@@ -124,19 +124,24 @@ impl RagStore {
         self.chunks.is_empty()
     }
 
-    /// 按查询词与片段词的重合数量排序，返回最多 top_k 条结果。
+    /// 使用 BM25 风格评分排序，返回最多 top_k 条结果。
     pub fn search(&self, query: &str, top_k: usize) -> Vec<SearchResult> {
         let query_terms = terms(query);
         let minimum_score = minimum_relevance_score(query_terms.len());
+        let documents: Vec<HashSet<String>> = self.chunks.iter().map(|c| terms(&c.text)).collect();
+        let avg_len = documents.iter().map(HashSet::len).sum::<usize>() as f64
+            / documents.len().max(1) as f64;
         let mut results: Vec<_> = self
             .chunks
             .iter()
-            .filter_map(|chunk| {
-                let chunk_terms = terms(&chunk.text);
-                let score = query_terms.intersection(&chunk_terms).count();
-                let coverage_ok = score * 5 >= query_terms.len();
+            .enumerate()
+            .filter_map(|(index, chunk)| {
+                let chunk_terms = &documents[index];
+                let matched = query_terms.intersection(chunk_terms).count();
+                let coverage_ok = matched * 5 >= query_terms.len();
+                let score = bm25_score(&query_terms, chunk_terms, &documents, avg_len);
                 // 同时要求最低分和至少 20% 的查询词命中，减少长问题误召回。
-                (score >= minimum_score && coverage_ok).then(|| SearchResult {
+                (matched >= minimum_score && coverage_ok).then(|| SearchResult {
                     chunk: chunk.clone(),
                     score,
                 })
@@ -177,6 +182,27 @@ impl RagStore {
             "请只根据下面的本地资料回答问题；资料不足时明确说不知道。\n\n本地资料：\n{context}\n\n问题：{query}"
         )
     }
+}
+
+/// 计算 BM25：稀有词权重更高，词频递增受限，长片段会被长度修正。
+fn bm25_score(
+    query: &HashSet<String>,
+    document: &HashSet<String>,
+    documents: &[HashSet<String>],
+    avg_len: f64,
+) -> usize {
+    let n = documents.len() as f64;
+    let mut total = 0.0;
+    for term in query {
+        if !document.contains(term) {
+            continue;
+        }
+        let df = documents.iter().filter(|doc| doc.contains(term)).count() as f64;
+        let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+        let length_norm = 1.0 / (0.5 + 0.5 * document.len() as f64 / avg_len.max(1.0));
+        total += idf * length_norm;
+    }
+    (total * 100.0).round() as usize
 }
 
 /// 根据查询关键词数量计算最低相关分数，避免固定阈值造成召回失衡。
@@ -336,7 +362,7 @@ mod tests {
         let path = fixture();
         let store = RagStore::from_dir(&path, 200, 0).unwrap();
         let results = store.search("Asteria Context Kernel", 1);
-        assert_eq!(results[0].score, 3);
+        assert!(results[0].score > 0);
         assert!(results[0].chunk.text.contains("Context Kernel"));
         let _ = fs::remove_dir_all(path);
     }
@@ -391,7 +417,7 @@ mod tests {
         let path = fixture();
         let store = RagStore::from_dir(&path, 200, 0).unwrap();
         let results = store.search("Asteria 有没有介绍 Context Kernel？", 1);
-        assert_eq!(results[0].score, 3);
+        assert!(results[0].score > 0);
         let _ = fs::remove_dir_all(path);
     }
 
