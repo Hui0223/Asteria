@@ -144,7 +144,15 @@ fn prepare_rag_input(store: Option<&RagStore>, question: &str, output: &Output) 
     let Some(store) = store else {
         return question.to_owned();
     };
-    let results = store.search(question, 3);
+    let (results, prompt) = if let Some(file_name) = mentioned_docx_file(question) {
+        let results = store.search_document(&file_name, 6);
+        let prompt = store.build_prompt_from_results(question, &results);
+        (results, prompt)
+    } else {
+        let results = store.search(question, 3);
+        let prompt = store.build_prompt_from_results(question, &results);
+        (results, prompt)
+    };
     if results.is_empty() {
         output.print("[RAG 检索] 当前问题没有命中文档，继续使用普通 Agent 对话。");
         return question.to_owned();
@@ -165,7 +173,16 @@ fn prepare_rag_input(store: Option<&RagStore>, question: &str, output: &Output) 
             .collect::<Vec<_>>()
             .join("\n")
     ));
-    store.build_prompt(question, 3)
+    prompt
+}
+
+/// 从用户问题中提取明确提到的 DOCX 文件名，支持带空格的路径末段。
+fn mentioned_docx_file(question: &str) -> Option<String> {
+    let marker = ".docx";
+    let end = question.to_ascii_lowercase().find(marker)? + marker.len();
+    let start = question[..end].rfind('/').map_or(0, |index| index + 1);
+    let file_name = question[start..end].trim_matches(['"', '\'', '`']);
+    (!file_name.is_empty()).then(|| file_name.to_owned())
 }
 
 /// 将结构化 AgentEvent 转换成清晰的 TUI 事件日志。

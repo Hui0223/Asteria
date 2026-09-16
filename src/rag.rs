@@ -158,9 +158,32 @@ impl RagStore {
         results
     }
 
+    /// 按文件名定位文档并返回其前几个片段，适合用户明确指定某个文件的场景。
+    pub fn search_document(&self, file_name: &str, top_k: usize) -> Vec<SearchResult> {
+        self.chunks
+            .iter()
+            .filter(|chunk| {
+                chunk
+                    .source
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy() == file_name)
+            })
+            .take(top_k)
+            .map(|chunk| SearchResult {
+                chunk: chunk.clone(),
+                score: 0,
+            })
+            .collect()
+    }
+
     /// 把检索结果组装为带来源标记的增强 Prompt，供 Asteria 或其他模型使用。
     pub fn build_prompt(&self, query: &str, top_k: usize) -> String {
         let results = self.search(query, top_k);
+        self.build_prompt_from_results(query, &results)
+    }
+
+    /// 使用指定的检索结果组装增强 Prompt，支持 BM25 和文件定位共用模板。
+    pub fn build_prompt_from_results(&self, query: &str, results: &[SearchResult]) -> String {
         let context = if results.is_empty() {
             "没有检索到相关本地资料。".into()
         } else {
@@ -471,6 +494,17 @@ mod tests {
         let path = fixture();
         let store = RagStore::from_dir(&path, 200, 0).unwrap();
         assert!(!store.search("介绍Asteria基本功能", 1).is_empty());
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    /// 用户明确指定文件名时，应能定位该文档而不依赖问题关键词得分。
+    fn searches_document_by_file_name() {
+        let path = fixture();
+        let store = RagStore::from_dir(&path, 200, 0).unwrap();
+        let results = store.search_document("guide.md", 2);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].score, 0);
         let _ = fs::remove_dir_all(path);
     }
 }
