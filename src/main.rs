@@ -1,56 +1,59 @@
-mod approval_ui;
 mod terminal;
+mod tui;
 
 use anyhow::{Context, Result, bail};
-use approval_ui::ApprovalUi;
 use asteria_agent::{
     agent::Asteria,
     agent_loop::{CancelToken, TurnState},
-    events::{AgentEvent, EventSink},
     permission::ChannelApprover,
     rag::RagStore,
 };
 use std::collections::VecDeque;
 use terminal::{InputEvent, Output, Terminal};
+use tui::ApprovalUi;
 
 /// 启动命令行 Agent，由行编辑器负责输入与屏幕重绘。
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     dotenvy::dotenv().ok();
     let mut agent = Asteria::new()?;
-    let rag_store = load_default_rag_store()?;
+    let rag_chunks = match load_default_rag_store()? {
+        Some(store) => {
+            let count = store.len();
+            agent.enable_search_docs(store);
+            Some(count)
+        }
+        None => None,
+    };
     let (approver, requests) = ChannelApprover::channel();
     agent.set_tool_approver(std::sync::Arc::new(approver));
     let mut approvals = ApprovalUi::new(requests);
     let mut terminal = Terminal::start()?;
-    let retry_output = terminal.output.clone();
-    agent.set_retry_output(move |message| retry_output.print(message));
-    agent.set_event_sink(std::sync::Arc::new(TuiEventSink {
-        output: terminal.output.clone(),
-    }));
-    terminal.output.print(format!(
-        "=== Asteria 已启动 ===\n模型：{}\n命令：/context 记忆 | /usage 用量 | /reset 清空 | /exit 退出\n取消：Ctrl+C 或 /cancel",
-        agent.model()
-    ));
-    terminal.output.print(
-        "工具权限：/permissions 查看；/permission <工具名> allow|deny|ask 设置；待批准时使用 /approve <编号> 或 /deny <编号>。",
-    );
-    if let Some(store) = &rag_store {
-        terminal.output.print(format!(
-            "知识库：已加载 {} 个片段（来源：docs/rag-docs）。命中时自动检索。",
-            store.len()
-        ));
-    } else {
-        terminal.output.print(
-            "知识库：未加载。将使用普通 Agent 对话。若要启用 RAG，请把文档放入 docs/rag-docs。",
-        );
+    let tui_state = tui::new_state();
+    agent.set_event_sink(std::sync::Arc::new(tui::TuiEventSink::new(
+        terminal.output.clone(),
+        tui_state.clone(),
+    )));
+    let trust_project_mcp = arguments
+        .iter()
+        .any(|argument| argument == "--trust-project-mcp");
+    terminal.output.print("[MCP] 正在加载配置并连接 Server...");
+    if let Err(error) = agent.enable_mcp(trust_project_mcp).await {
+        terminal
+            .output
+            .print(format!("[MCP] 配置加载失败，Asteria 将继续启动：{error:#}"));
     }
+    terminal.output.print(format!(
+        "Asteria · {}\n{} · {}\n/usage /trace /mcp /permissions /verbose · Ctrl+C 取消 · /exit 退出",
+        agent.model(),
+        rag_chunks.map_or_else(|| "RAG 未加载".into(), |count| format!("RAG {count} chunks")),
+        mcp_summary(&agent)
+    ));
     let mut queued: VecDeque<String> = VecDeque::new();
     loop {
         let input = if let Some(line) = queued.pop_front() {
-            terminal
-                .output
-                .print(format!("--- 开始处理排队问题 ---\n用户：{}", line.trim()));
+            terminal.output.print("↳ 开始处理排队问题");
             line
         } else {
             tokio::select! {
@@ -77,14 +80,30 @@ async fn main() -> Result<()> {
         if permission_command(&mut agent, &input, &terminal.output) {
             continue;
         }
+        if verbose_command(&input, &tui_state, &terminal.output) {
+            continue;
+        }
         match input.trim() {
             "/exit" => break,
             "/cancel" => terminal.output.print("当前没有运行中的 Turn。"),
             "/context" => print_context(&agent, &terminal.output),
             "/usage" => print_usage(&agent, &terminal.output),
-            "/session" => terminal
-                .output
-                .print(format!("[Session] {}", agent.session_path().display())),
+            command if command.starts_with("/mcp") => {
+                mcp_command(&mut agent, command, trust_project_mcp, &terminal.output).await
+            }
+            command if command.starts_with("/trace") => {
+                print_trace(&agent, command, &terminal.output)
+            }
+            "/session" => {
+                let paths = agent.session_paths();
+                terminal.output.print(format!(
+                    "[Session]\n目录：{}\n上下文：{}\n审计：{}\n状态：{}",
+                    paths.directory.display(),
+                    paths.context.display(),
+                    paths.trace.display(),
+                    paths.state.display()
+                ));
+            }
             "/new-session" => match agent.new_session() {
                 Ok(()) => terminal.output.print("[Session] 已创建新的空会话。"),
                 Err(error) => terminal.output.print(format!("创建新会话失败: {error:#}")),
@@ -95,19 +114,21 @@ async fn main() -> Result<()> {
             }
             "" => {}
             text => {
-                let rag_input = prepare_rag_input(rag_store.as_ref(), text, &terminal.output);
                 match ask_interruptible(
                     &mut agent,
-                    &rag_input,
+                    text,
                     &mut terminal,
                     &mut queued,
                     &mut approvals,
                 )
                 .await
                 {
-                    Ok(answer) => terminal
-                        .output
-                        .print(format!("=== Asteria 回答 ===\n{answer}")),
+                    Ok(answer) => {
+                        if !tui::take_answer_streamed(&tui_state) {
+                            terminal.output.print(format!("Asteria\n{answer}"));
+                        }
+                        print_turn_summary(&agent, &tui_state, &terminal.output);
+                    }
                     Err(_)
                         if agent
                             .last_turn()
@@ -122,7 +143,6 @@ async fn main() -> Result<()> {
                         .print(format!("=== 执行失败 ===\n原因：{error:#}")),
                 }
                 approvals.clear();
-                print_usage(&agent, &terminal.output);
             }
         }
     }
@@ -139,139 +159,6 @@ fn load_default_rag_store() -> Result<Option<RagStore>> {
     Ok(Some(RagStore::from_dir(path, 500, 50)?))
 }
 
-/// 根据当前用户输入检索文档；没有命中时保留普通 Agent 对话。
-fn prepare_rag_input(store: Option<&RagStore>, question: &str, output: &Output) -> String {
-    let Some(store) = store else {
-        return question.to_owned();
-    };
-    let (results, prompt) = if let Some(file_name) = mentioned_docx_file(question) {
-        let results = store.search_document(&file_name, 6);
-        let prompt = store.build_prompt_from_results(question, &results);
-        (results, prompt)
-    } else {
-        let results = store.search(question, 3);
-        let prompt = store.build_prompt_from_results(question, &results);
-        (results, prompt)
-    };
-    if results.is_empty() {
-        output.print("[RAG 检索] 当前问题没有命中文档，继续使用普通 Agent 对话。");
-        return question.to_owned();
-    }
-    output.print(format!(
-        "[RAG 检索] 命中 {} 个片段：\n{}",
-        results.len(),
-        results
-            .iter()
-            .enumerate()
-            .map(|(index, result)| format!(
-                "  {}. {} · 片段 {} · BM25 {}",
-                index + 1,
-                result.chunk.source.display(),
-                result.chunk.index,
-                result.score
-            ))
-            .collect::<Vec<_>>()
-            .join("\n")
-    ));
-    prompt
-}
-
-/// 从用户问题中提取明确提到的 DOCX 文件名，支持带空格的路径末段。
-fn mentioned_docx_file(question: &str) -> Option<String> {
-    let marker = ".docx";
-    let end = question.to_ascii_lowercase().find(marker)? + marker.len();
-    let start = question[..end].rfind('/').map_or(0, |index| index + 1);
-    let file_name = question[start..end].trim_matches(['"', '\'', '`']);
-    (!file_name.is_empty()).then(|| file_name.to_owned())
-}
-
-/// 将结构化 AgentEvent 转换成清晰的 TUI 事件日志。
-struct TuiEventSink {
-    output: Output,
-}
-
-impl EventSink for TuiEventSink {
-    /// 将事件交给 Reedline 外部输出通道，避免破坏当前输入行。
-    fn publish(&self, event: AgentEvent) {
-        let line = match event {
-            AgentEvent::TurnStarted { turn_id, input } => {
-                format!("[执行] Turn {turn_id} 开始\n用户：{}", preview(&input))
-            }
-            AgentEvent::StepStarted { turn_id, step } => {
-                format!("[执行] Turn {turn_id} · Step {step}\n动作：请求模型")
-            }
-            AgentEvent::ToolCallStarted {
-                turn_id,
-                call_id,
-                name,
-            } => format!("[工具] Turn {turn_id} 开始调用\n工具：{name}\n调用：{call_id}"),
-            AgentEvent::ToolResult {
-                turn_id,
-                call_id,
-                is_error,
-                duration_ms,
-            } => format!(
-                "[工具] Turn {turn_id} 调用结束\n调用：{call_id}\n结果：{} · 耗时：{}ms",
-                if is_error { "失败" } else { "成功" },
-                duration_ms
-            ),
-            AgentEvent::PermissionRequested {
-                turn_id,
-                call_id,
-                name,
-            } => {
-                format!("[权限] Turn {turn_id} 等待确认\n工具：{name}\n调用：{call_id}")
-            }
-            AgentEvent::PermissionResolved {
-                turn_id,
-                call_id,
-                allowed,
-            } => {
-                format!(
-                    "[权限] Turn {turn_id} {}\n调用：{call_id}",
-                    if allowed { "已批准" } else { "已拒绝" }
-                )
-            }
-            AgentEvent::StepCompleted {
-                turn_id,
-                step,
-                usage,
-            } => format!(
-                "[执行] Turn {turn_id} · Step {step} 完成\n本次 Token：{}",
-                usage.total_tokens
-            ),
-            AgentEvent::StepRetrying {
-                turn_id,
-                step,
-                failed_attempt,
-                next_attempt,
-                max_attempts,
-                delay_ms,
-            } => format!(
-                "[重试] Turn {turn_id} · Step {step}\n第 {failed_attempt} 次失败，准备第 {next_attempt}/{max_attempts} 次\n等待：{delay_ms}ms"
-            ),
-            AgentEvent::TurnCompleted { turn_id, steps } => {
-                format!("[完成] Turn {turn_id}\n共执行：{steps} 个 Step")
-            }
-            AgentEvent::TurnCancelled { turn_id } => format!("[取消] Turn {turn_id}\n状态：已取消"),
-            AgentEvent::TurnFailed { turn_id, message } => {
-                format!("[失败] Turn {turn_id}\n原因：{message}")
-            }
-        };
-        self.output.print(line);
-    }
-}
-
-/// 压缩事件中的用户输入，避免长问题淹没 TUI。
-fn preview(input: &str) -> String {
-    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut result = compact.chars().take(120).collect::<String>();
-    if compact.chars().count() > 120 {
-        result.push('…');
-    }
-    result
-}
-
 /// 同时等待回答、输入与取消；普通输入排队，取消后等待回滚完成。
 async fn ask_interruptible(
     agent: &mut Asteria,
@@ -282,7 +169,7 @@ async fn ask_interruptible(
 ) -> Result<String> {
     terminal
         .output
-        .print("--- 正在处理 ---\n可以继续输入并回车排队；输入 /cancel 或按 Ctrl+C 取消当前轮。");
+        .print("… 正在处理 · Enter 排队 · Ctrl+C 或 /cancel 取消");
     let cancel = CancelToken::new();
     let request = agent.ask_with_cancel(input, &cancel);
     tokio::pin!(request);
@@ -365,6 +252,26 @@ fn permission_command(agent: &mut Asteria, input: &str, output: &Output) -> bool
     true
 }
 
+/// 切换默认紧凑视图与完整事件日志；只影响显示，不改变持久化事件。
+fn verbose_command(input: &str, state: &tui::SharedTuiState, output: &Output) -> bool {
+    let parts = input.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["/verbose"] => output.print(format!(
+            "[界面] 当前为{}模式。用法：/verbose on|off",
+            if tui::is_verbose(state) {
+                "详细"
+            } else {
+                "紧凑"
+            }
+        )),
+        ["/verbose", "on"] => tui::set_verbose(state, true, output),
+        ["/verbose", "off"] => tui::set_verbose(state, false, output),
+        ["/verbose", ..] => output.print("用法：/verbose on|off"),
+        _ => return false,
+    }
+    true
+}
+
 /// 显示原始记忆；Debug 转义控制字符，整块输出后由编辑器恢复输入行。
 fn print_context(agent: &Asteria, output: &Output) {
     let context = agent.context();
@@ -407,5 +314,201 @@ fn print_usage(agent: &Asteria, output: &Output) {
     ));
     lines
         .push("说明：只累计模型实际返回的 usage；未返回的用量未知。/reset 不清空累计用量。".into());
+    output.print(lines.join("\n"));
+}
+
+/// Turn 结束后只显示一行摘要，完整统计仍由 /usage 提供。
+fn print_turn_summary(agent: &Asteria, state: &tui::SharedTuiState, output: &Output) {
+    let Some(turn) = agent.last_turn() else {
+        return;
+    };
+    let elapsed = tui::take_turn_elapsed(state, turn.id);
+    output.print(format!(
+        "  {}",
+        tui::render::turn_summary(turn.steps, turn.retries, turn.usage.total_tokens, elapsed)
+    ));
+}
+
+/// 显示 MCP 配置来源、连接状态和注册后的命名空间工具。
+fn print_mcp(agent: &Asteria, output: &Output) {
+    let Some(manager) = agent.mcp_manager() else {
+        output.print("[MCP] 尚未加载。");
+        return;
+    };
+    let mut lines = vec![format!(
+        "[MCP] 已连接 {}/{} 个 Server，注册 {} 个工具",
+        manager.active_connections(),
+        manager.statuses().len(),
+        manager
+            .statuses()
+            .iter()
+            .map(|server| server.tools.len())
+            .sum::<usize>()
+    )];
+    if manager.loaded_files().is_empty() {
+        lines.push("配置：未找到 ~/.asteria/mcp.json".into());
+    } else {
+        lines.push(format!(
+            "配置：{}",
+            manager
+                .loaded_files()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(path) = manager.skipped_project_file() {
+        lines.push(format!(
+            "项目配置已跳过：{}（使用 --trust-project-mcp 显式信任）",
+            path.display()
+        ));
+    }
+    if manager.statuses().is_empty() && !manager.loaded_files().is_empty() {
+        lines
+            .push("提示：配置文件已读取，但 mcpServers 为空；当前没有可连接的 MCP Server。".into());
+    }
+    for server in manager.statuses() {
+        lines.push(format!(
+            "- {}: {} · {} 个工具{}",
+            server.name,
+            server.state,
+            server.tools.len(),
+            server
+                .detail
+                .as_ref()
+                .map(|detail| format!(" · {detail}"))
+                .unwrap_or_default()
+        ));
+        if !server.tools.is_empty() {
+            lines.push(format!("  {}", server.tools.join(", ")));
+        }
+    }
+    output.print(lines.join("\n"));
+}
+
+fn mcp_summary(agent: &Asteria) -> String {
+    let Some(manager) = agent.mcp_manager() else {
+        return "MCP 未加载".into();
+    };
+    let tools = manager
+        .statuses()
+        .iter()
+        .map(|server| server.tools.len())
+        .sum::<usize>();
+    format!(
+        "MCP {}/{} servers · {tools} tools",
+        manager.active_connections(),
+        manager.statuses().len()
+    )
+}
+
+/// 在空闲状态执行 MCP 生命周期命令，避免 Turn 进行中修改模型工具列表。
+async fn mcp_command(agent: &mut Asteria, command: &str, trust_project: bool, output: &Output) {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["/mcp"] | ["/mcp", "status"] => print_mcp(agent, output),
+        ["/mcp", "tools"] => {
+            let Some(manager) = agent.mcp_manager() else {
+                output.print("[MCP] 尚未加载。");
+                return;
+            };
+            let tools = manager
+                .statuses()
+                .iter()
+                .flat_map(|server| {
+                    server
+                        .tools
+                        .iter()
+                        .map(move |tool| format!("{}: {tool}", server.name))
+                })
+                .collect::<Vec<_>>();
+            output.print(if tools.is_empty() {
+                "[MCP] 当前没有已注册工具。".into()
+            } else {
+                format!("[MCP] 已注册工具\n{}", tools.join("\n"))
+            });
+        }
+        ["/mcp", "reload"] => match agent.reload_mcp(trust_project).await {
+            Ok(()) => {
+                output.print("[MCP] 配置已原子重载。");
+                print_mcp(agent, output);
+            }
+            Err(error) => output.print(format!("[MCP] 重载失败：{error:#}")),
+        },
+        ["/mcp", "connect", server] => {
+            match agent.connect_mcp_server(trust_project, server).await {
+                Ok(()) => {
+                    output.print(format!("[MCP] Server `{server}` 已连接。"));
+                    print_mcp(agent, output);
+                }
+                Err(error) => output.print(format!("[MCP] 连接失败：{error:#}")),
+            }
+        }
+        ["/mcp", "disconnect", server] => match agent.disconnect_mcp_server(server).await {
+            Ok(()) => {
+                output.print(format!("[MCP] Server `{server}` 已断开。"));
+                print_mcp(agent, output);
+            }
+            Err(error) => output.print(format!("[MCP] 断开失败：{error:#}")),
+        },
+        _ => output.print("用法：/mcp [status|tools|reload|connect <server>|disconnect <server>]"),
+    }
+}
+
+/// 显示最近 Turn 或指定 Turn 的脱敏工具调用记录，不读取工具结果正文。
+fn print_trace(agent: &Asteria, command: &str, output: &Output) {
+    let parts: Vec<_> = command.split_whitespace().collect();
+    let turn_id = match parts.as_slice() {
+        ["/trace"] => agent.last_turn().map(|turn| turn.id),
+        ["/trace", value] => match value.parse::<u64>() {
+            Ok(turn_id) => Some(turn_id),
+            Err(_) => {
+                output.print("用法：/trace 或 /trace <turn_id>");
+                return;
+            }
+        },
+        _ => {
+            output.print("用法：/trace 或 /trace <turn_id>");
+            return;
+        }
+    };
+    let Some(turn_id) = turn_id else {
+        output.print("[ToolTrace] 尚未执行 Turn。");
+        return;
+    };
+    let traces = match agent.tool_traces(Some(turn_id)) {
+        Ok(traces) => traces,
+        Err(error) => {
+            output.print(format!("读取 ToolTrace 失败: {error:#}"));
+            return;
+        }
+    };
+    if traces.is_empty() {
+        output.print(format!("[ToolTrace] Turn {turn_id} 没有工具调用记录。"));
+        return;
+    }
+    let mut lines = vec![format!(
+        "[ToolTrace] Turn {turn_id} · {} 次调用（审计记录不参与模型上下文）",
+        traces.len()
+    )];
+    for (index, trace) in traces.iter().enumerate() {
+        lines.push(format!(
+            "{}. Step {} · {} · {}\n调用：{}\n参数：{}\n参数哈希：{} · 结果哈希：{}\n耗时：{}ms · 完成：{}",
+            index + 1,
+            trace.step,
+            trace.tool_name,
+            match trace.status {
+                asteria_agent::events::ToolTraceStatus::Success => "成功",
+                asteria_agent::events::ToolTraceStatus::Error => "失败",
+            },
+            trace.call_id,
+            trace.arguments_preview,
+            trace.arguments_hash,
+            trace.result_hash,
+            trace.duration_ms,
+            trace.completed_at,
+        ));
+    }
     output.print(lines.join("\n"));
 }

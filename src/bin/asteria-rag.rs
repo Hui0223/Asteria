@@ -35,13 +35,12 @@ async fn main() -> Result<()> {
         RagStore::from_dir(&source, 500, 50)?
     };
     if generate {
+        let chunk_count = store.len();
         let mut agent = Asteria::new()?;
-        println!(
-            "知识库已加载：{} 个片段。输入问题，/exit 退出。",
-            store.len()
-        );
+        agent.enable_search_docs(store);
+        println!("知识库已加载：{chunk_count} 个片段。需要资料时会调用 search_docs；/exit 退出。");
         if !query.trim().is_empty() {
-            answer_query(&store, &mut agent, &query).await?;
+            answer_query(&mut agent, &query).await?;
         }
         loop {
             print!("\n你: ");
@@ -53,7 +52,7 @@ async fn main() -> Result<()> {
             if question.trim().is_empty() {
                 continue;
             }
-            answer_query(&store, &mut agent, question.trim()).await?;
+            answer_query(&mut agent, question.trim()).await?;
         }
     } else {
         println!(
@@ -65,25 +64,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// 为单个问题检索资料、调用 Asteria 并打印最终答案。
-async fn answer_query(store: &RagStore, agent: &mut Asteria, question: &str) -> Result<()> {
-    let results = store.search(question, 3);
-    if results.is_empty() {
-        println!("\n[RAG 检索] 没有命中相关资料，Agent 将被要求明确说明资料不足。");
-    } else {
-        println!("\n[RAG 检索] 命中 {} 个资料片段：", results.len());
-        for (index, result) in results.iter().enumerate() {
-            println!(
-                "  {}. {} · 片段 {} · 匹配分数 {}",
-                index + 1,
-                result.chunk.source.display(),
-                result.chunk.index,
-                result.score
-            );
-        }
-    }
-    let prompt = store.build_prompt(question, 3);
-    let answer = agent.ask(&prompt).await?;
+/// 把原始问题交给 Agent；是否检索由 search_docs 工具决定。
+async fn answer_query(agent: &mut Asteria, question: &str) -> Result<()> {
+    let answer = agent.ask(question).await?;
     println!("\n=== Asteria RAG 回答 ===\n{answer}");
     Ok(())
 }

@@ -18,6 +18,13 @@ pub struct ToolExecutionResult {
     pub call_id: String,
     pub output: ToolOutput,
     pub duration_ms: u128,
+    /// 仅 Ask 权限产生 Some；用于区分用户拒绝与批准后的工具执行失败。
+    pub permission_allowed: Option<bool>,
+}
+
+struct ToolExecutionOutcome {
+    output: ToolOutput,
+    permission_allowed: Option<bool>,
 }
 
 /// 工具执行时携带的运行上下文。
@@ -37,6 +44,11 @@ pub trait AgentTool: Send + Sync {
     fn schema(&self) -> Value;
     /// 校验原始 JSON 参数并执行工具。
     async fn execute(&self, raw_args: &str) -> ToolOutput;
+
+    /// 返回该工具独立的执行超时；None 使用 Registry 默认值。
+    fn execution_timeout(&self) -> Option<Duration> {
+        None
+    }
 
     /// 带上下文的执行入口；默认兼容旧工具实现。
     async fn execute_with_context(
@@ -85,6 +97,27 @@ impl ToolRegistry {
         self.tools.insert(name, Box::new(tool));
     }
 
+    /// 注销一个动态工具及其运行时权限。
+    pub fn unregister(&mut self, name: &str) -> bool {
+        self.permissions.remove(name);
+        self.tools.remove(name).is_some()
+    }
+
+    /// 按名称前缀批量注销动态工具，返回已删除名称。
+    pub fn unregister_prefix(&mut self, prefix: &str) -> Vec<String> {
+        let mut names = self
+            .tools
+            .keys()
+            .filter(|name| name.starts_with(prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        for name in &names {
+            self.unregister(name);
+        }
+        names
+    }
+
     /// 修改已存在工具的会话权限，未知名称返回错误。
     pub fn set_permission(&mut self, name: &str, permission: ToolPermission) -> anyhow::Result<()> {
         anyhow::ensure!(self.tools.contains_key(name), "未知工具: {name}");
@@ -131,6 +164,7 @@ impl ToolRegistry {
             },
         )
         .await
+        .output
     }
 
     /// 权限通过后才创建工具执行 Future、开始执行计时；拒绝也返回配对工具结果。
@@ -140,37 +174,48 @@ impl ToolRegistry {
         raw_args: &str,
         call_id: Option<&str>,
         context: ToolExecutionContext,
-    ) -> ToolOutput {
-        let output = match self.tools.get(name) {
+    ) -> ToolExecutionOutcome {
+        let (output, permission_allowed) = match self.tools.get(name) {
             Some(tool) => {
                 if let Err(error) = validate_arguments(tool.schema(), raw_args) {
-                    return truncate_output(
-                        ToolOutput {
-                            content: format!("工具执行失败: 参数校验失败: {error}"),
-                            is_error: true,
-                        },
-                        self.max_output_chars,
-                    );
+                    return ToolExecutionOutcome {
+                        output: truncate_output(
+                            ToolOutput {
+                                content: format!("工具执行失败: 参数校验失败: {error}"),
+                                is_error: true,
+                            },
+                            self.max_output_chars,
+                        ),
+                        permission_allowed: None,
+                    };
                 }
-                let allowed = match self.permissions.get(name).copied().unwrap_or_default() {
-                    ToolPermission::Allow => true,
-                    ToolPermission::Deny => false,
-                    ToolPermission::Ask => match &self.approver {
-                        Some(approver) => approver.approve(name, raw_args, call_id).await,
-                        None => false,
-                    },
+                let permission = self.permissions.get(name).copied().unwrap_or_default();
+                let (allowed, permission_allowed) = match permission {
+                    ToolPermission::Allow => (true, None),
+                    ToolPermission::Deny => (false, None),
+                    ToolPermission::Ask => {
+                        let allowed = match &self.approver {
+                            Some(approver) => approver.approve(name, raw_args, call_id).await,
+                            None => false,
+                        };
+                        (allowed, Some(allowed))
+                    }
                 };
                 if !allowed {
-                    return truncate_output(
-                        ToolOutput {
-                            content: format!("工具执行失败: 权限拒绝或未获批准: {name}"),
-                            is_error: true,
-                        },
-                        self.max_output_chars,
-                    );
+                    return ToolExecutionOutcome {
+                        output: truncate_output(
+                            ToolOutput {
+                                content: format!("工具执行失败: 权限拒绝或未获批准: {name}"),
+                                is_error: true,
+                            },
+                            self.max_output_chars,
+                        ),
+                        permission_allowed,
+                    };
                 }
-                match tokio::time::timeout(
-                    self.max_execution_time,
+                let execution_timeout = tool.execution_timeout().unwrap_or(self.max_execution_time);
+                let output = match tokio::time::timeout(
+                    execution_timeout,
                     tool.execute_with_context(raw_args, context),
                 )
                 .await
@@ -178,19 +223,26 @@ impl ToolRegistry {
                     Ok(output) => output,
                     Err(_) => ToolOutput {
                         content: format!(
-                            "工具执行失败: 执行超时（超过 {} 秒）",
-                            self.max_execution_time.as_secs()
+                            "工具执行失败: 执行超时（超过 {}ms）",
+                            execution_timeout.as_millis()
                         ),
                         is_error: true,
                     },
-                }
+                };
+                (output, permission_allowed)
             }
-            None => ToolOutput {
-                content: format!("工具执行失败: 未知工具: {name}"),
-                is_error: true,
-            },
+            None => (
+                ToolOutput {
+                    content: format!("工具执行失败: 未知工具: {name}"),
+                    is_error: true,
+                },
+                None,
+            ),
         };
-        truncate_output(output, self.max_output_chars)
+        ToolExecutionOutcome {
+            output: truncate_output(output, self.max_output_chars),
+            permission_allowed,
+        }
     }
 
     /// 并发执行一批工具，结果按模型返回的调用顺序排序。
@@ -206,7 +258,7 @@ impl ToolRegistry {
             let call_id = call.id.clone();
             pending.push(async move {
                 let started = std::time::Instant::now();
-                let output = self
+                let outcome = self
                     .execute_call(
                         &call.name,
                         &call.arguments,
@@ -221,8 +273,9 @@ impl ToolRegistry {
                 ToolExecutionResult {
                     index,
                     call_id,
-                    output,
+                    output: outcome.output,
                     duration_ms: started.elapsed().as_millis(),
+                    permission_allowed: outcome.permission_allowed,
                 }
             });
         }
@@ -292,6 +345,7 @@ impl Default for ToolRegistry {
         registry.register_with_permission(CalculateTool, ToolPermission::Allow);
         registry.register_with_permission(CurrentTimeTool, ToolPermission::Allow);
         registry.register_with_permission(WaitForTool, ToolPermission::Allow);
+        crate::core_tools::register(&mut registry);
         registry
     }
 }
@@ -425,10 +479,36 @@ mod tests {
     /// 注册中心 Schema 与默认工具集合保持一致。
     fn default_registry_exposes_builtins() {
         let schema = ToolRegistry::default().schema();
-        assert_eq!(schema.as_array().unwrap().len(), 3);
+        assert_eq!(schema.as_array().unwrap().len(), 9);
         assert!(schema.to_string().contains("calculate"));
         assert!(schema.to_string().contains("current_time"));
         assert!(schema.to_string().contains("wait_for"));
+        for tool in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
+            assert!(schema.to_string().contains(tool));
+        }
+    }
+
+    #[test]
+    fn core_tool_permissions_follow_risk_level() {
+        let permissions = ToolRegistry::default()
+            .permissions()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        for tool in ["Read", "Glob", "Grep"] {
+            assert_eq!(permissions.get(tool), Some(&ToolPermission::Allow));
+        }
+        for tool in ["Write", "Edit", "Bash"] {
+            assert_eq!(permissions.get(tool), Some(&ToolPermission::Ask));
+        }
+    }
+
+    #[test]
+    fn unregister_prefix_removes_tool_and_permission() {
+        let mut registry = ToolRegistry::new();
+        registry.register_with_permission(CountedTool(Arc::default()), ToolPermission::Allow);
+        assert_eq!(registry.unregister_prefix("count"), vec!["counted"]);
+        assert!(registry.permissions().is_empty());
+        assert!(registry.schema().as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -529,6 +609,63 @@ mod tests {
         let output = registry.execute("sleeping", "{}").await;
         assert!(output.is_error);
         assert!(output.content.contains("执行超时"));
+    }
+
+    struct ShortTimeoutTool;
+
+    #[async_trait::async_trait]
+    impl AgentTool for ShortTimeoutTool {
+        fn name(&self) -> &str {
+            "short_timeout"
+        }
+
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"short_timeout","parameters":{"type":"object"}}})
+        }
+
+        fn execution_timeout(&self) -> Option<Duration> {
+            Some(Duration::from_millis(5))
+        }
+
+        async fn execute(&self, _: &str) -> ToolOutput {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            ToolOutput {
+                content: "不应到达".into(),
+                is_error: false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_specific_timeout_overrides_registry_default() {
+        let mut registry = ToolRegistry::new();
+        registry.register_with_permission(ShortTimeoutTool, ToolPermission::Allow);
+        let output = registry.execute("short_timeout", "{}").await;
+        assert!(output.is_error);
+        assert!(output.content.contains("5ms"));
+    }
+
+    #[tokio::test]
+    async fn approved_ask_is_distinct_from_tool_execution_failure() {
+        use crate::message::ToolCall;
+        use crate::permission::ChannelApprover;
+
+        let mut registry = ToolRegistry::new();
+        registry.register_with_permission(ShortTimeoutTool, ToolPermission::Ask);
+        let (approver, mut requests) = ChannelApprover::channel();
+        registry.set_approver(Arc::new(approver));
+        let calls = vec![ToolCall {
+            id: "approved-timeout".into(),
+            name: "short_timeout".into(),
+            arguments: "{}".into(),
+        }];
+        let cancel = CancelToken::new();
+        let (results, ()) = tokio::join!(registry.execute_batch(&calls, 1, &cancel), async {
+            requests.recv().await.unwrap().reply.send(true).unwrap();
+        });
+        assert_eq!(results[0].permission_allowed, Some(true));
+        assert!(results[0].output.is_error);
+        assert!(results[0].output.content.contains("执行超时"));
     }
 
     #[tokio::test]

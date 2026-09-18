@@ -7,9 +7,11 @@ import fcntl
 import os
 import pty
 import select
+import shutil
 import signal
 import struct
 import subprocess
+import tempfile
 import termios
 import time
 from pathlib import Path
@@ -17,6 +19,8 @@ from pathlib import Path
 import pyte
 
 ROOT = Path(__file__).resolve().parents[1]
+TARGET_DIR = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+BINARY = TARGET_DIR / "debug/asteria-agent"
 
 
 class Terminal:
@@ -27,6 +31,8 @@ class Terminal:
         self.original_mode = termios.tcgetattr(self.master)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, columns, 0, 0))
         environment = dict(os.environ, TERM="xterm-256color")
+        self.session_dir = Path(tempfile.mkdtemp(prefix="asteria-tui-test-"))
+        environment["ASTERIA_SESSION_PATH"] = str(self.session_dir)
         environment.update(env_overrides or {})
 
         def controlling_terminal():
@@ -35,7 +41,7 @@ class Terminal:
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
         self.process = subprocess.Popen(
-            [str(ROOT / "target/debug/asteria-agent")], cwd=ROOT, env=environment,
+            [str(BINARY)], cwd=ROOT, env=environment,
             stdin=slave, stdout=slave, stderr=slave, preexec_fn=controlling_terminal,
         )
         os.close(slave)
@@ -44,11 +50,22 @@ class Terminal:
         self.screen.write_process_input = lambda data: os.write(self.master, data.encode())
         self.stream = pyte.ByteStream(self.screen)
         self.raw = ""
-        self.wait(lambda: self.line() == "你:")
+        self.wait(self.at_prompt)
 
     def line(self):
         """读取光标所在行的最终显示内容。"""
         return self.screen.display[self.screen.cursor.y].rstrip()
+
+    def at_prompt(self, text=""):
+        """编辑态把 User 放在方框第一行，输入落在下一行。"""
+        expected = "│ " + text
+        row = self.screen.cursor.y
+        return (
+            self.line().startswith(expected)
+            and row > 1
+            and "User" in self.screen.display[row - 1]
+            and self.screen.display[row - 2].lstrip().startswith("╭")
+        )
 
     def send(self, text):
         """一次性写入整段 UTF-8 和控制键，覆盖中文连输/粘贴场景。"""
@@ -73,10 +90,12 @@ class Terminal:
     def edited_command(self, typed, editing, command, output):
         """检查退格后的可见输入和实际执行的命令一致。"""
         self.send(typed + editing + command)
-        self.wait(lambda: self.line() == "你: " + command)
+        self.wait(lambda: self.at_prompt(command))
         start = len(self.raw)
         self.send("\r")
-        self.wait(lambda: output in self.raw[start:] and self.line() == "你:")
+        self.wait(lambda: output in self.raw[start:] and self.at_prompt())
+        assert "│ User" in self.raw[start:]
+        assert "╰" in self.raw[start:]
         assert "[处理中]" not in self.raw[start:], "命令残留前缀，误发给模型"
 
     def close(self):
@@ -91,12 +110,14 @@ class Terminal:
         mask = termios.ECHO | termios.ICANON | termios.ISIG
         assert termios.tcgetattr(self.master)[3] & mask == self.original_mode[3] & mask
         os.close(self.master)
+        shutil.rmtree(self.session_dir, ignore_errors=True)
 
     def cleanup(self):
         """只在失败时回收本测试启动的进程。"""
         if self.process.poll() is None:
             self.process.kill()
             self.process.wait()
+        shutil.rmtree(self.session_dir, ignore_errors=True)
 
 
 def check_editing():
@@ -111,7 +132,7 @@ def check_editing():
             terminal.edited_command("中文标点" * 8, "\x7f" * 32, "/context", "messages=0")
             terminal.edited_command("\x1b[200~、、\x1b[201~", "\x7f" * 2, "/usage", "尚未执行 Turn")
             terminal.send("残留中文\x03")
-            terminal.wait(lambda: "当前没有运行中的 Turn" in terminal.raw and terminal.line() == "你:")
+            terminal.wait(lambda: "当前没有运行中的 Turn" in terminal.raw and terminal.at_prompt())
             terminal.close()
             print(f"PASS: {width}列，中文/标点/组合字符/光标/跨行/粘贴/Ctrl+C/退出恢复")
         finally:
@@ -122,25 +143,28 @@ def check_live():
     """真实 DeepSeek 回答期间保留输入草稿，并验证 /cancel 与 SIGINT。"""
     terminal = Terminal()
     try:
-        terminal.send("请用300字介绍Rust所有权。\r")
-        terminal.wait(lambda: "[处理中]" in terminal.raw)
-        terminal.send("中文草稿、、")
-        terminal.wait(lambda: "state=Completed" in terminal.raw, timeout=150)
-        terminal.wait(lambda: terminal.line() == "你: 中文草稿、、")
         start = len(terminal.raw)
-        terminal.edited_command("", "\x7f" * 6, "/usage", "context_messages=2")
-        assert "state=Failed" not in terminal.raw[start:]
+        terminal.send("请用300字介绍Rust所有权。\r")
+        terminal.wait(lambda: "正在处理" in terminal.raw[start:])
+        terminal.send("中文草稿、、")
+        terminal.wait(lambda: "tokens" in terminal.raw[start:], timeout=150)
+        terminal.wait(lambda: terminal.at_prompt("中文草稿、、"))
+        start = len(terminal.raw)
+        terminal.edited_command("", "\x7f" * 6, "/usage", "上下文消息：2")
+        assert "=== 执行失败 ===" not in terminal.raw[start:]
         print("PASS: 真实回答与用量输出后，中文草稿保持完整；删除草稿后 /usage 正确执行")
         for cancel in ("/cancel\r", "\x03", "SIGINT"):
             start = len(terminal.raw)
             terminal.send("请写3000字的Rust教程。\r")
-            terminal.wait(lambda: "[处理中]" in terminal.raw[start:])
+            terminal.wait(lambda: "正在处理" in terminal.raw[start:])
             if cancel == "SIGINT":
                 os.kill(terminal.process.pid, signal.SIGINT)
             else:
                 terminal.send(cancel)
-            terminal.wait(lambda: "state=Cancelled" in terminal.raw[start:] and terminal.line() == "你:")
-            assert "context_messages=2" in terminal.raw[start:]
+            terminal.wait(lambda: "Turn 已取消" in terminal.raw[start:] and terminal.at_prompt())
+            context_start = len(terminal.raw)
+            terminal.send("/context\r")
+            terminal.wait(lambda: "messages=2" in terminal.raw[context_start:] and terminal.at_prompt())
             print(f"PASS: 真实请求 {cancel!r} 取消，原始历史仍为2条")
         terminal.close()
     finally:
@@ -156,11 +180,11 @@ def check_retry_output():
     })
     try:
         terminal.send("连接故障测试\r")
-        terminal.wait(lambda: "[Retry]" in terminal.raw)
+        terminal.wait(lambda: "↻ Step" in terminal.raw)
         terminal.send("中文草稿、、")
-        terminal.wait(lambda: "state=Failed" in terminal.raw)
-        terminal.wait(lambda: terminal.line() == "你: 中文草稿、、")
-        terminal.edited_command("", "\x7f" * 6, "/usage", "context_messages=0")
+        terminal.wait(lambda: "=== 执行失败 ===" in terminal.raw)
+        terminal.wait(lambda: terminal.at_prompt("中文草稿、、"))
+        terminal.edited_command("", "\x7f" * 6, "/usage", "上下文消息：0")
         terminal.close()
         print("PASS: 真实连接失败、重试及失败报告输出后，中文输入行保持完整")
     finally:

@@ -1,13 +1,12 @@
 use crate::{
     context_builder::PreparedContext,
     message::{Message, ToolCall},
-    provider::{AssistantTurn, ModelProvider, TokenUsage},
+    provider::{AssistantTurn, ModelProvider, TextDeltaSink, TokenUsage},
 };
 use anyhow::{Context, Result};
 use reqwest::Client;
-use serde::Deserialize;
 use serde_json::{Value, json};
-use std::env;
+use std::{collections::BTreeMap, env};
 
 const API_URL: &str = "https://api.deepseek.com/chat/completions";
 
@@ -34,25 +33,15 @@ impl DeepSeekProvider {
         })
     }
 
-    /// 执行一次 DeepSeek HTTP 请求并解析为统一助手消息。
-    async fn request(&self, context: &PreparedContext, tools: Value) -> Result<AssistantTurn> {
-        let (tools, tool_choice) = if context.force_calculation() {
-            let calculate_only = tools
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter(|item| item["function"]["name"] == "calculate")
-                        .cloned()
-                        .collect()
-                })
-                .map(Value::Array)
-                .unwrap_or(tools);
-            (calculate_only, json!("required"))
-        } else {
-            (tools, json!("auto"))
-        };
-        let response: ChatResponse = self
+    /// 执行一次 DeepSeek SSE 请求，边读边推送正文增量。
+    async fn request(
+        &self,
+        context: &PreparedContext,
+        tools: Value,
+        on_delta: Option<&TextDeltaSink>,
+    ) -> Result<AssistantTurn> {
+        let (tools, tool_choice) = select_tools(context, tools);
+        let mut response = self
             .client
             .post(&self.api_url)
             .bearer_auth(&self.api_key)
@@ -61,40 +50,91 @@ impl DeepSeekProvider {
                 "messages": project(context),
                 "tools": tools,
                 "tool_choice": tool_choice,
-                "thinking": {"type": "disabled"}
+                "thinking": {"type": "disabled"},
+                "stream": true,
+                "stream_options": {"include_usage": true}
             }))
             .send()
             .await
-            .context("无法连接 DeepSeek API")?
-            .error_for_status()
-            .context("DeepSeek API 返回错误")?
-            .json()
-            .await
-            .context("无法解析 DeepSeek 响应")?;
+            .context("无法连接 DeepSeek API")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("DeepSeek API 返回错误: {status} {body}");
+        }
 
-        let message = response
-            .choices
-            .into_iter()
-            .next()
-            .context("DeepSeek 响应中没有 message")?
-            .message;
-        Ok(AssistantTurn {
-            content: message.content,
-            tool_calls: message
-                .tool_calls
-                .into_iter()
-                .map(|call| ToolCall {
-                    id: call.id,
-                    name: call.function.name,
-                    arguments: call.function.arguments,
-                })
-                .collect(),
-            usage: response.usage.map(|usage| TokenUsage {
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-            }),
-        })
+        let mut assembler = StreamAssembler::default();
+        let mut leftover = String::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("读取 DeepSeek 流式响应失败")?
+        {
+            leftover.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(idx) = leftover.find('\n') {
+                let mut line: String = leftover.drain(..=idx).collect();
+                if line.ends_with('\n') {
+                    line.pop();
+                }
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+                if assembler.ingest_line(&line, on_delta)? {
+                    return Ok(assembler.finish());
+                }
+            }
+        }
+        if !leftover.trim().is_empty() {
+            let _ = assembler.ingest_line(leftover.trim(), on_delta)?;
+        }
+        Ok(assembler.finish())
+    }
+}
+
+fn select_tools(context: &PreparedContext, tools: Value) -> (Value, Value) {
+    if let Some(forced_name) = context.forced_tool_name() {
+        let selected = tools
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item["function"]["name"] == forced_name)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (Value::Array(selected), json!("required"))
+    } else if context.force_calculation() {
+        let calculate_only = tools
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item["function"]["name"] == "calculate")
+                    .cloned()
+                    .collect()
+            })
+            .map(Value::Array)
+            .unwrap_or(tools);
+        (calculate_only, json!("required"))
+    } else if context.force_search_docs() {
+        let search_only = tools
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item["function"]["name"] == "search_docs")
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if search_only.is_empty() {
+            (tools, json!("auto"))
+        } else {
+            (Value::Array(search_only), json!("required"))
+        }
+    } else {
+        (tools, json!("auto"))
     }
 }
 
@@ -106,7 +146,17 @@ impl ModelProvider for DeepSeekProvider {
 
     /// 把中立上下文转换成 DeepSeek 协议并完成一个模型 Step。
     async fn complete(&self, context: &PreparedContext, tools: Value) -> Result<AssistantTurn> {
-        self.request(context, tools).await
+        self.request(context, tools, None).await
+    }
+
+    /// 通过 Chat Completions SSE 推送 assistant.delta。
+    async fn complete_streaming(
+        &self,
+        context: &PreparedContext,
+        tools: Value,
+        on_delta: TextDeltaSink,
+    ) -> Result<AssistantTurn> {
+        self.request(context, tools, Some(&on_delta)).await
     }
 }
 
@@ -146,48 +196,103 @@ fn project(context: &PreparedContext) -> Vec<Value> {
     wire
 }
 
-/// DeepSeek 顶层响应中当前任务需要读取的字段。
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
-    #[serde(default)]
-    usage: Option<ResponseUsage>,
+/// 把 Chat Completions SSE 分片拼成完整 AssistantTurn。
+#[derive(Default)]
+struct StreamAssembler {
+    content: String,
+    tools: BTreeMap<usize, PartialToolCall>,
+    usage: Option<TokenUsage>,
 }
 
-/// DeepSeek usage 对象中的输入、输出和总 Token 数。
-#[derive(Deserialize)]
-struct ResponseUsage {
-    prompt_tokens: usize,
-    completion_tokens: usize,
-    total_tokens: usize,
-}
-
-/// DeepSeek 候选答案中的消息包装层。
-#[derive(Deserialize)]
-struct Choice {
-    message: AssistantResponse,
-}
-
-/// DeepSeek 返回的助手正文和工具调用列表。
-#[derive(Deserialize)]
-struct AssistantResponse {
-    content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<ResponseToolCall>,
-}
-
-/// DeepSeek 工具调用的 ID 与函数描述。
-#[derive(Deserialize)]
-struct ResponseToolCall {
+#[derive(Default)]
+struct PartialToolCall {
     id: String,
-    function: ResponseFunction,
-}
-
-/// DeepSeek 函数调用中的名称和原始 JSON 参数。
-#[derive(Deserialize)]
-struct ResponseFunction {
     name: String,
     arguments: String,
+}
+
+impl StreamAssembler {
+    /// 解析一行 SSE；遇到 `[DONE]` 时返回 true。
+    fn ingest_line(&mut self, line: &str, on_delta: Option<&TextDeltaSink>) -> Result<bool> {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') {
+            return Ok(false);
+        }
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(false);
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            return Ok(true);
+        }
+        self.ingest_json(data, on_delta)?;
+        Ok(false)
+    }
+
+    fn ingest_json(&mut self, data: &str, on_delta: Option<&TextDeltaSink>) -> Result<()> {
+        let value: Value = serde_json::from_str(data).context("无法解析 DeepSeek 流式分片")?;
+        if let Some(usage) = value.get("usage").filter(|item| !item.is_null()) {
+            self.usage = Some(TokenUsage {
+                prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as usize,
+                completion_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as usize,
+                total_tokens: usage["total_tokens"].as_u64().unwrap_or(0) as usize,
+            });
+        }
+        let Some(choice) = value.get("choices").and_then(|choices| choices.get(0)) else {
+            return Ok(());
+        };
+        let delta = choice
+            .get("delta")
+            .or_else(|| choice.get("message"))
+            .unwrap_or(&Value::Null);
+        if let Some(text) = delta.get("content").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            self.content.push_str(text);
+            if let Some(sink) = on_delta {
+                sink(text);
+            }
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let entry = self.tools.entry(index).or_default();
+                if let Some(id) = call.get("id").and_then(Value::as_str)
+                    && !id.is_empty()
+                {
+                    entry.id = id.to_owned();
+                }
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                    entry.name.push_str(name);
+                }
+                if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
+                {
+                    entry.arguments.push_str(arguments);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> AssistantTurn {
+        AssistantTurn {
+            content: if self.content.is_empty() {
+                None
+            } else {
+                Some(self.content)
+            },
+            tool_calls: self
+                .tools
+                .into_values()
+                .map(|call| ToolCall {
+                    id: call.id,
+                    name: call.name,
+                    arguments: call.arguments,
+                })
+                .collect(),
+            usage: self.usage,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +375,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_tool_request_sends_only_named_tool_as_required() {
+        let mut context = ContextMemory::new("system");
+        context
+            .append_user("调用 mcp__fixture__echo，参数 text 为 MCP-RECONNECT-002")
+            .unwrap();
+        let tools = json!([
+            {"type":"function","function":{"name":"calculate","parameters":{"type":"object"}}},
+            {"type":"function","function":{"name":"mcp__fixture__echo","parameters":{"type":"object"}}}
+        ]);
+        let prepared = ContextBuilder::new(ContextPolicy::default(), HeuristicTokenEstimator)
+            .prepare(&context, &tools)
+            .unwrap();
+        let (selected, choice) = select_tools(&prepared, tools);
+        assert_eq!(choice, "required");
+        assert_eq!(selected.as_array().unwrap().len(), 1);
+        assert_eq!(
+            selected[0]["function"]["name"],
+            Value::String("mcp__fixture__echo".into())
+        );
+    }
+
     /// 用真实 TCP 连接让服务停在响应头或正文读取阶段，再取消 Agent。
     async fn check_http_cancellation(partial_body: bool) {
         use crate::agent_loop::{AgentLoop, CancelToken, LoopConfig, TurnState};
@@ -333,6 +460,62 @@ mod tests {
         assert_eq!(report.retries, 0);
         assert_eq!(report.usage.total_tokens, 0);
         assert!(memory.messages().is_empty());
+    }
+
+    #[test]
+    fn stream_assembler_merges_content_and_tool_calls() {
+        let mut assembler = StreamAssembler::default();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink: TextDeltaSink = {
+            let seen = seen.clone();
+            std::sync::Arc::new(move |delta: &str| seen.lock().unwrap().push_str(delta))
+        };
+        assembler
+            .ingest_line(
+                r#"data: {"choices":[{"delta":{"content":"你好"}}]}"#,
+                Some(&sink),
+            )
+            .unwrap();
+        assembler
+            .ingest_line(
+                r#"data: {"choices":[{"delta":{"content":"世界"}}]}"#,
+                Some(&sink),
+            )
+            .unwrap();
+        assembler
+            .ingest_line(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"Read","arguments":""}}]}}]}"#,
+                Some(&sink),
+            )
+            .unwrap();
+        assembler
+            .ingest_line(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.rs\"}"}}]}}]}"#,
+                Some(&sink),
+            )
+            .unwrap();
+        assembler
+            .ingest_line(
+                r#"data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+                Some(&sink),
+            )
+            .unwrap();
+        assert!(assembler.ingest_line("data: [DONE]", Some(&sink)).unwrap());
+        let turn = assembler.finish();
+        assert_eq!(turn.content.as_deref(), Some("你好世界"));
+        assert_eq!(seen.lock().unwrap().as_str(), "你好世界");
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].id, "c1");
+        assert_eq!(turn.tool_calls[0].name, "Read");
+        assert_eq!(turn.tool_calls[0].arguments, r#"{"path":"a.rs"}"#);
+        assert_eq!(
+            turn.usage,
+            Some(TokenUsage {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                total_tokens: 5
+            })
+        );
     }
 
     #[tokio::test]

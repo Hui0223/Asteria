@@ -1,8 +1,8 @@
 use crate::{
     context::ContextMemory,
     context_builder::{ContextBuilder, ContextPolicy, HeuristicTokenEstimator},
-    events::{AgentEvent, EventSink, NoopEventSink},
-    provider::{ModelProvider, TokenUsage},
+    events::{AgentEvent, EventSink, NoopEventSink, ToolTrace},
+    provider::{ModelProvider, TextDeltaSink, TokenUsage},
     tools,
 };
 use anyhow::{Result, bail};
@@ -32,6 +32,7 @@ pub struct TurnReport {
     pub context_truncated: bool,
     pub usage: TokenUsage,
     pub retries: usize,
+    pub tool_traces: Vec<ToolTrace>,
 }
 
 /// 控制单个 Turn 最多允许多少次“模型思考 → 工具处理”的 Step。
@@ -58,7 +59,6 @@ pub struct AgentLoop<P> {
     context_builder: ContextBuilder<HeuristicTokenEstimator>,
     session_usage: TokenUsage,
     retry_policy: crate::retry::RetryPolicy,
-    retry_output: Option<Box<dyn Fn(String) + Send + Sync>>,
     tool_registry: tools::ToolRegistry,
     tool_call_keys: HashSet<String>,
     event_sink: std::sync::Arc<dyn EventSink>,
@@ -87,7 +87,6 @@ impl<P: ModelProvider> AgentLoop<P> {
             tool_registry: tools::ToolRegistry::default(),
             tool_call_keys: HashSet::new(),
             event_sink: std::sync::Arc::new(NoopEventSink),
-            retry_output: None,
         }
     }
 
@@ -99,11 +98,6 @@ impl<P: ModelProvider> AgentLoop<P> {
     /// 设置事件接收器；之后每个 Turn、Step 和 ToolCall 都会发出事件。
     pub fn set_event_sink(&mut self, sink: std::sync::Arc<dyn EventSink>) {
         self.event_sink = sink;
-    }
-
-    /// 注入重试信息的输出入口，使 CLI 能在重绘输入行时安全显示日志。
-    pub fn set_retry_output(&mut self, output: impl Fn(String) + Send + Sync + 'static) {
-        self.retry_output = Some(Box::new(output));
     }
 
     /// 设置请求重试策略，拒绝没有首次尝试的配置。
@@ -133,6 +127,26 @@ impl<P: ModelProvider> AgentLoop<P> {
         approver: std::sync::Arc<dyn crate::permission::ToolApprover>,
     ) {
         self.tool_registry.set_approver(approver);
+    }
+
+    /// 注册额外工具并指定权限，不影响已有内置工具。
+    pub fn register_tool_with_permission<T: tools::AgentTool + 'static>(
+        &mut self,
+        tool: T,
+        permission: crate::permission::ToolPermission,
+    ) {
+        self.tool_registry
+            .register_with_permission(tool, permission);
+    }
+
+    /// 注销一个动态工具及其权限。
+    pub fn unregister_tool(&mut self, name: &str) -> bool {
+        self.tool_registry.unregister(name)
+    }
+
+    /// 按名称前缀批量注销动态工具。
+    pub fn unregister_tools_with_prefix(&mut self, prefix: &str) -> Vec<String> {
+        self.tool_registry.unregister_prefix(prefix)
     }
 
     /// 返回最近一个 Turn 的执行报告，便于观测和测试状态变化。
@@ -205,6 +219,7 @@ impl<P: ModelProvider> AgentLoop<P> {
             context_truncated: false,
             usage: TokenUsage::default(),
             retries: 0,
+            tool_traces: Vec::new(),
         });
         self.tool_call_keys.clear();
         self.event_sink.publish(AgentEvent::TurnStarted {
@@ -232,16 +247,18 @@ impl<P: ModelProvider> AgentLoop<P> {
                 turn_id,
                 step: step_number,
             });
-            let tool_schema = self.tool_registry.schema();
+            let all_tool_schema = self.tool_registry.schema();
+            let tool_schema = crate::tool_router::route(context.messages(), &all_tool_schema);
             let prepared = self.context_builder.prepare(context, &tool_schema)?;
             self.record_prepared_context(prepared.estimated_tokens(), prepared.truncated());
             let mut attempt = 1;
             let message = loop {
                 self.ensure_not_cancelled(cancel)?;
+                let on_delta = streaming_delta_sink(&self.event_sink, turn_id, step_number);
                 // 优先接收已就绪的响应以记录 usage，然后再检查取消。
                 let response = tokio::select! {
                     biased;
-                    result = self.provider.complete(&prepared, tool_schema.clone()) => Some(result),
+                    result = self.provider.complete_streaming(&prepared, tool_schema.clone(), on_delta) => Some(result),
                     _ = cancel.cancelled() => None,
                 };
                 let Some(response) = response else {
@@ -269,17 +286,6 @@ impl<P: ModelProvider> AgentLoop<P> {
                             max_attempts: self.retry_policy.max_attempts,
                             delay_ms: delay.as_millis(),
                         });
-                        let notice = format!(
-                            "[Retry] attempt={}/{} delay={}ms",
-                            attempt + 1,
-                            self.retry_policy.max_attempts,
-                            delay.as_millis()
-                        );
-                        if let Some(output) = &self.retry_output {
-                            output(notice);
-                        } else {
-                            eprintln!("{notice}");
-                        }
                         if !crate::retry::wait(delay, cancel).await {
                             self.ensure_not_cancelled(cancel)?;
                         }
@@ -289,6 +295,14 @@ impl<P: ModelProvider> AgentLoop<P> {
             };
             if let Some(usage) = &message.usage {
                 self.record_usage(usage);
+            }
+            if let Some(forced_name) = prepared.forced_tool_name()
+                && !message
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.name == forced_name)
+            {
+                bail!("模型未按要求调用工具 `{forced_name}`，已拒绝其文本回答");
             }
             self.event_sink.publish(AgentEvent::StepCompleted {
                 turn_id,
@@ -337,34 +351,50 @@ impl<P: ModelProvider> AgentLoop<P> {
                         bail!("当前 Turn 已取消");
                     }
             };
-            let mut outputs: HashMap<String, (tools::ToolOutput, u128)> = results
+            let mut outputs: HashMap<String, (tools::ToolOutput, u128, Option<bool>)> = results
                 .into_iter()
-                .map(|result| (result.call_id, (result.output, result.duration_ms)))
+                .map(|result| {
+                    (
+                        result.call_id,
+                        (result.output, result.duration_ms, result.permission_allowed),
+                    )
+                })
                 .collect();
             for call in calls {
-                let (output, duration_ms) = outputs.remove(&call.id).unwrap_or_else(|| {
-                    (
-                        tools::ToolOutput {
-                            content: if duplicate_ids.contains(&call.id) {
-                                "工具执行失败: 当前 Turn 已重复调用相同工具和参数".into()
-                            } else {
-                                "工具执行失败: 缺少工具结果".into()
+                let (output, duration_ms, permission_allowed) =
+                    outputs.remove(&call.id).unwrap_or_else(|| {
+                        (
+                            tools::ToolOutput {
+                                content: if duplicate_ids.contains(&call.id) {
+                                    "工具执行失败: 当前 Turn 已重复调用相同工具和参数".into()
+                                } else {
+                                    "工具执行失败: 缺少工具结果".into()
+                                },
+                                is_error: true,
                             },
-                            is_error: true,
-                        },
-                        0,
-                    )
-                });
-                let call_id = call.id;
+                            0,
+                            None,
+                        )
+                    });
                 let is_error = output.is_error;
+                let trace = ToolTrace::completed(
+                    turn_id,
+                    step_number,
+                    &call,
+                    &output.content,
+                    is_error,
+                    duration_ms,
+                );
+                let call_id = call.id;
                 context.append_tool_result(call_id.clone(), output.content, is_error)?;
-                if self.tool_registry.permission(&call.name)
-                    == Some(crate::permission::ToolPermission::Ask)
-                {
+                if let Some(turn) = &mut self.last_turn {
+                    turn.tool_traces.push(trace);
+                }
+                if let Some(allowed) = permission_allowed {
                     self.event_sink.publish(AgentEvent::PermissionResolved {
                         turn_id,
                         call_id: call_id.clone(),
-                        allowed: !is_error,
+                        allowed,
                     });
                 }
                 self.event_sink.publish(AgentEvent::ToolResult {
@@ -439,6 +469,28 @@ impl<P: ModelProvider> AgentLoop<P> {
             .as_ref()
             .map_or(TurnState::Failed, |turn| turn.state)
     }
+}
+
+/// 把模型增量转成易失 AssistantDelta；offset 按字节累加，供 TUI 去重。
+fn streaming_delta_sink(
+    event_sink: &std::sync::Arc<dyn EventSink>,
+    turn_id: u64,
+    step: usize,
+) -> TextDeltaSink {
+    let event_sink = event_sink.clone();
+    let offset = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    std::sync::Arc::new(move |delta: &str| {
+        if delta.is_empty() {
+            return;
+        }
+        let start = offset.fetch_add(delta.len(), std::sync::atomic::Ordering::Relaxed);
+        event_sink.publish(AgentEvent::AssistantDelta {
+            turn_id,
+            step,
+            delta: delta.to_owned(),
+            offset: start,
+        });
+    })
 }
 
 #[cfg(test)]
@@ -521,6 +573,25 @@ mod tests {
         let report = agent_loop.last_turn().unwrap();
         assert_eq!(report.steps, 1);
         assert_eq!(report.state, TurnState::Completed);
+    }
+
+    #[tokio::test]
+    async fn rejects_plain_answer_when_named_tool_was_forced() {
+        let provider = FakeProvider::new(vec![answer("伪造的工具返回")]);
+        let mut agent_loop = AgentLoop::new(provider, LoopConfig::default());
+        let mut context = ContextMemory::new("system");
+
+        let error = agent_loop
+            .run_turn(
+                &mut context,
+                "调用 calculate，参数 expression 为 1+1",
+                &CancelToken::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("未按要求调用工具 `calculate`"));
+        assert!(context.messages().is_empty());
+        assert_eq!(agent_loop.last_turn().unwrap().state, TurnState::Failed);
     }
 
     #[tokio::test]
@@ -864,10 +935,18 @@ mod tests {
         );
         assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolCallStarted { call_id, .. } if call_id == "event-tool")));
         assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolResult { call_id, is_error: false, .. } if call_id == "event-tool")));
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::AssistantDelta { delta, .. } if delta == "2")
+        ));
         assert!(matches!(
             events.last(),
             Some(AgentEvent::TurnCompleted { .. })
         ));
+        let traces = &engine.last_turn().unwrap().tool_traces;
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].call_id, "event-tool");
+        assert_eq!(traces[0].tool_name, "calculate");
+        assert!(traces[0].arguments_preview.contains("expression"));
     }
 
     #[tokio::test]

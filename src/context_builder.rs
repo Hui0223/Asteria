@@ -78,7 +78,9 @@ pub struct PreparedContext {
     messages: Vec<Message>,
     estimated_tokens: usize,
     truncated: bool,
+    forced_tool_name: Option<String>,
     force_calculation: bool,
+    force_search_docs: bool,
 }
 
 impl PreparedContext {
@@ -107,9 +109,19 @@ impl PreparedContext {
         self.truncated
     }
 
+    /// 返回用户明确点名并要求调用的已注册工具。
+    pub fn forced_tool_name(&self) -> Option<&str> {
+        self.forced_tool_name.as_deref()
+    }
+
     /// 表示当前用户问题是否应强制使用 calculate 工具。
     pub fn force_calculation(&self) -> bool {
         self.force_calculation
+    }
+
+    /// 表示当前用户问题是否应强制检索本地文档。
+    pub fn force_search_docs(&self) -> bool {
+        self.force_search_docs
     }
 }
 
@@ -130,22 +142,31 @@ impl<E: TokenEstimator> ContextBuilder<E> {
         memory.validate()?;
         let hard_limit = self.policy.hard_input_limit()?;
         let target = self.policy.target_input_tokens()?;
+        let messages = visible_messages(memory.messages());
+        let forced_tool_name = latest_explicit_tool_request(&messages, tools);
+        let force_calculation =
+            forced_tool_name.is_none() && latest_requires_calculation(&messages);
+        let force_search_docs = forced_tool_name.is_none()
+            && !force_calculation
+            && latest_requires_search_docs(&messages);
         let base_tokens = self.estimate_text(memory.system_prompt())
             + self.estimate_text(&serde_json::to_string(tools)?);
         if base_tokens > hard_limit {
             bail!("系统提示和工具定义已经超过上下文输入上限");
         }
 
-        let ranges = turn_ranges(memory.messages());
-        let all_tokens = base_tokens + self.estimate_messages(memory.messages());
+        let ranges = turn_ranges(&messages);
+        let all_tokens = base_tokens + self.estimate_messages(&messages);
         if all_tokens <= target {
             return Ok(PreparedContext {
                 system_prompt: memory.system_prompt().to_owned(),
                 summary: None,
-                messages: memory.messages().to_vec(),
+                messages,
                 estimated_tokens: all_tokens,
                 truncated: false,
-                force_calculation: latest_requires_calculation(memory.messages()),
+                forced_tool_name,
+                force_calculation,
+                force_search_docs,
             });
         }
 
@@ -156,10 +177,12 @@ impl<E: TokenEstimator> ContextBuilder<E> {
                 messages: Vec::new(),
                 estimated_tokens: base_tokens,
                 truncated: false,
-                force_calculation: latest_requires_calculation(memory.messages()),
+                forced_tool_name,
+                force_calculation,
+                force_search_docs,
             });
         };
-        let current_tokens = self.estimate_messages(&memory.messages()[current_start..current_end]);
+        let current_tokens = self.estimate_messages(&messages[current_start..current_end]);
         if base_tokens + current_tokens > hard_limit {
             bail!("系统提示、工具定义和当前 Turn 已超过上下文输入上限");
         }
@@ -169,7 +192,7 @@ impl<E: TokenEstimator> ContextBuilder<E> {
         let keep_limit = self.policy.recent_turns_to_keep.max(1);
         while selected_start > 0 && ranges.len() - selected_start < keep_limit {
             let (start, end) = ranges[selected_start - 1];
-            let turn_tokens = self.estimate_messages(&memory.messages()[start..end]);
+            let turn_tokens = self.estimate_messages(&messages[start..end]);
             if selected_tokens + turn_tokens > target {
                 break;
             }
@@ -178,8 +201,8 @@ impl<E: TokenEstimator> ContextBuilder<E> {
         }
 
         let first_message = ranges[selected_start].0;
-        let summary = summarize_messages(&memory.messages()[..first_message]).and_then(|summary| {
-            let messages_tokens = self.estimate_messages(&memory.messages()[first_message..]);
+        let summary = summarize_messages(&messages[..first_message]).and_then(|summary| {
+            let messages_tokens = self.estimate_messages(&messages[first_message..]);
             let remaining = hard_limit.saturating_sub(base_tokens + messages_tokens);
             (remaining > 0).then(|| fit_summary(&self.estimator, &summary, remaining))
         });
@@ -187,17 +210,19 @@ impl<E: TokenEstimator> ContextBuilder<E> {
             + summary
                 .as_deref()
                 .map_or(0, |text| self.estimate_text(text))
-            + self.estimate_messages(&memory.messages()[first_message..]);
+            + self.estimate_messages(&messages[first_message..]);
         if selected_tokens > hard_limit {
             bail!("摘要和当前上下文超过输入上限");
         }
         Ok(PreparedContext {
             system_prompt: memory.system_prompt().to_owned(),
             summary,
-            messages: memory.messages()[first_message..].to_vec(),
+            messages: messages[first_message..].to_vec(),
             estimated_tokens: selected_tokens,
             truncated: first_message > 0,
-            force_calculation: latest_requires_calculation(memory.messages()),
+            forced_tool_name,
+            force_calculation,
+            force_search_docs,
         })
     }
 
@@ -239,22 +264,108 @@ impl<E: TokenEstimator> ContextBuilder<E> {
     }
 }
 
-/// 用轻量规则识别明确的数学请求，避免把普通聊天错误强制成工具调用。
-fn latest_requires_calculation(messages: &[Message]) -> bool {
-    let Some(user_index) = messages
+/// 发给模型前去掉旧版 RAG 把整份资料塞进用户消息的过期片段。
+fn visible_messages(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|message| match message {
+            Message::User { content } => Message::User {
+                content: unwrap_stale_rag_prompt(content),
+            },
+            other => other.clone(),
+        })
+        .collect()
+}
+
+fn unwrap_stale_rag_prompt(content: &str) -> String {
+    let stale = content.contains("请只根据下面的本地资料回答问题")
+        && (content.contains("本地资料：") || content.contains("[资料 "));
+    if !stale {
+        return content.to_owned();
+    }
+    content
+        .rsplit("\n问题：")
+        .next()
+        .map(str::trim)
+        .filter(|question| !question.is_empty() && *question != content)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| content.to_owned())
+}
+
+fn latest_user_index(messages: &[Message]) -> Option<usize> {
+    messages
         .iter()
         .rposition(|message| matches!(message, Message::User { .. }))
-    else {
-        return false;
-    };
-    // 工具结果已经回写后，当前 Step 允许模型生成最终文本。
+}
+
+fn latest_user_awaiting_tools(messages: &[Message]) -> Option<&str> {
+    let user_index = latest_user_index(messages)?;
     if messages[user_index + 1..]
         .iter()
         .any(|message| matches!(message, Message::Tool { .. }))
     {
-        return false;
+        return None;
     }
-    let Message::User { content } = &messages[user_index] else {
+    match &messages[user_index] {
+        Message::User { content } => Some(content.as_str()),
+        _ => None,
+    }
+}
+
+/// 用户明确要求调用一个真实存在的工具时，返回该工具名以消除 auto 选择歧义。
+fn latest_explicit_tool_request(messages: &[Message], tools: &Value) -> Option<String> {
+    let content = latest_user_awaiting_tools(messages)?;
+    let lower = content.to_ascii_lowercase();
+    let requests_call = content.contains("请调用")
+        || content.contains("必须调用")
+        || content.contains("帮我调用")
+        || content.contains("调用工具")
+        || content.contains("请使用")
+        || content.contains("必须使用")
+        || content.contains("使用工具")
+        || lower.contains("call tool")
+        || lower.contains("use tool");
+    let normalized = content.replace('`', "");
+    let trimmed = normalized.trim_start();
+    tools
+        .as_array()?
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .filter(|name| {
+            normalized.contains(name)
+                && (requests_call
+                    || ["调用", "使用"].iter().any(|action| {
+                        trimmed
+                            .strip_prefix(action)
+                            .is_some_and(|rest| rest.trim_start().starts_with(name))
+                    }))
+        })
+        .max_by_key(|name| name.len())
+        .map(ToOwned::to_owned)
+}
+
+/// 章节、目录和明确本地手册问题必须先检索，避免模型凭历史或文件名猜测。
+fn latest_requires_search_docs(messages: &[Message]) -> bool {
+    let Some(content) = latest_user_awaiting_tools(messages) else {
+        return false;
+    };
+    let lower = content.to_ascii_lowercase();
+    crate::rag::requested_chapter_number(content).is_some()
+        || crate::rag::is_outline_query(content)
+        || [
+            "知识库",
+            "本地资料",
+            "故障手册",
+            "troubleshooting",
+            "trouble shooting",
+        ]
+        .iter()
+        .any(|keyword| lower.contains(keyword))
+}
+
+/// 用轻量规则识别明确的数学请求，避免把普通聊天错误强制成工具调用。
+fn latest_requires_calculation(messages: &[Message]) -> bool {
+    let Some(content) = latest_user_awaiting_tools(messages) else {
         return false;
     };
     // “打印一行文字：计算1+1”是在复述文字，不是在请求计算。
@@ -545,6 +656,49 @@ mod tests {
     }
 
     #[test]
+    fn forces_explicitly_named_registered_tool() {
+        let mut memory = ContextMemory::new("system");
+        memory
+            .append_user("必须调用 mcp__fixture__echo，参数 text 为 ASTERIA-MCP-001，并告诉我结果")
+            .unwrap();
+        let tools = json!([
+            {"type":"function","function":{"name":"calculate","parameters":{"type":"object"}}},
+            {"type":"function","function":{"name":"mcp__fixture__echo","parameters":{"type":"object"}}}
+        ]);
+        let prepared = ContextBuilder::new(ContextPolicy::default(), CharacterEstimator)
+            .prepare(&memory, &tools)
+            .unwrap();
+        assert_eq!(prepared.forced_tool_name(), Some("mcp__fixture__echo"));
+        assert!(!prepared.force_calculation());
+        assert!(!prepared.force_search_docs());
+    }
+
+    #[test]
+    fn forces_named_tool_for_direct_chinese_call_command() {
+        let mut memory = ContextMemory::new("system");
+        memory
+            .append_user("调用 mcp__fixture__echo，参数 text 为 MCP-RECONNECT-002")
+            .unwrap();
+        let tools = json!([
+            {"type":"function","function":{"name":"mcp__fixture__echo","parameters":{"type":"object"}}}
+        ]);
+        let prepared = ContextBuilder::new(ContextPolicy::default(), CharacterEstimator)
+            .prepare(&memory, &tools)
+            .unwrap();
+        assert_eq!(prepared.forced_tool_name(), Some("mcp__fixture__echo"));
+    }
+
+    #[test]
+    fn does_not_force_unregistered_named_tool() {
+        let mut memory = ContextMemory::new("system");
+        memory.append_user("必须调用 missing_tool").unwrap();
+        let prepared = ContextBuilder::new(ContextPolicy::default(), CharacterEstimator)
+            .prepare(&memory, &json!([]))
+            .unwrap();
+        assert_eq!(prepared.forced_tool_name(), None);
+    }
+
+    #[test]
     /// 普通对话即使包含数字也不应被错误强制调用计算工具。
     fn does_not_force_calculation_for_normal_chat() {
         let mut memory = ContextMemory::new("system");
@@ -575,5 +729,77 @@ mod tests {
             .prepare(&memory, &json!([]))
             .unwrap();
         assert!(!prepared.force_calculation());
+    }
+
+    #[test]
+    /// 旧版把资料塞进用户消息的片段不能继续发给模型，章节问题要强制检索。
+    fn unwraps_stale_rag_prompt_and_forces_search_docs() {
+        let mut memory = ContextMemory::new("s");
+        memory
+            .append_user(
+                "请只根据下面的本地资料回答问题；资料不足时明确说不知道。\n\n本地资料：\n[资料 1]\nPAGEREF toc\n\n问题：这篇文档主要讲什么？",
+            )
+            .unwrap();
+        memory
+            .append_assistant(Some("只有目录".into()), Vec::new())
+            .unwrap();
+        memory.append_user("第14章节写的什么内容").unwrap();
+        let prepared = ContextBuilder::new(ContextPolicy::default(), CharacterEstimator)
+            .prepare(&memory, &json!([]))
+            .unwrap();
+        assert!(prepared.force_search_docs());
+        assert!(!prepared.force_calculation());
+        let Message::User { content } = &prepared.messages()[0] else {
+            panic!("expected user message");
+        };
+        assert_eq!(content, "这篇文档主要讲什么？");
+        assert!(!content.contains("PAGEREF"));
+        let Message::User { content } = prepared.messages().last().unwrap() else {
+            panic!("expected user message");
+        };
+        assert_eq!(content, "第14章节写的什么内容");
+    }
+
+    #[test]
+    fn troubleshooting_manual_question_forces_fresh_search() {
+        let mut memory = ContextMemory::new("s");
+        memory
+            .append_user("查看 trouble shooting 文档，LT 反复重启时如何 debug？")
+            .unwrap();
+        let prepared = ContextBuilder::new(ContextPolicy::default(), CharacterEstimator)
+            .prepare(&memory, &json!([]))
+            .unwrap();
+        assert!(prepared.force_search_docs());
+        assert!(!prepared.force_calculation());
+    }
+
+    #[test]
+    /// 当前 Turn 的检索结果必须保留到模型生成最终回答，且不能再次强制检索。
+    fn keeps_current_turn_search_result_for_answer_step() {
+        let mut memory = ContextMemory::new("s");
+        memory.append_user("第14章节写的什么内容").unwrap();
+        memory
+            .append_assistant(
+                None,
+                vec![ToolCall {
+                    id: "rag-1".into(),
+                    name: "search_docs".into(),
+                    arguments: r#"{"query":"第14章节写的什么内容"}"#.into(),
+                }],
+            )
+            .unwrap();
+        memory
+            .append_tool_result("rag-1", "第14章正文", false)
+            .unwrap();
+
+        let prepared = ContextBuilder::new(ContextPolicy::default(), CharacterEstimator)
+            .prepare(&memory, &json!([]))
+            .unwrap();
+        assert_eq!(prepared.messages(), memory.messages());
+        assert!(!prepared.force_search_docs());
+        assert!(matches!(
+            prepared.messages().last(),
+            Some(Message::Tool { content, .. }) if content == "第14章正文"
+        ));
     }
 }

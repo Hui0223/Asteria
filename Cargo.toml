@@ -16,6 +16,13 @@ quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zip = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util", "process"], default-features = false }
 tokio-util = { version = "0.7", features = ["rt"] }
 reedline = { version = "0.51", default-features = false, features = ["external_printer"] }
+rmcp = { version = "3.4.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+globset = "0.4.20"
+walkdir = "2.5.0"
+regex = "1.13.1"
+http = "1.5.0"
+terminal_size = "0.4.4"
+unicode-width = "0.2.2"
