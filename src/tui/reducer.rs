@@ -180,7 +180,7 @@ mod tests {
                     offset: "你".len(),
                 }
             ),
-            vec!["Asteria".to_string(), "你好".into()]
+            vec!["\nAsteria".to_string(), "你好".into()]
         );
         assert_eq!(
             reduce(
@@ -231,7 +231,7 @@ mod tests {
                     usage: TokenUsage::default(),
                 }
             ),
-            vec!["Asteria".to_string(), "abc".into()]
+            vec!["\nAsteria".to_string(), "abc".into()]
         );
     }
 }

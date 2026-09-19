@@ -32,6 +32,9 @@ pub struct McpServerConfig {
     pub enabled_tools: Option<BTreeSet<String>>,
     #[serde(default)]
     pub disabled_tools: BTreeSet<String>,
+    /// Pre-registered OAuth client ID (for example Binance `grok` / `codex`).
+    /// When omitted, the SDK tries CIMD then Dynamic Client Registration.
+    pub oauth_client_id: Option<String>,
 }
 
 impl McpServerConfig {
@@ -143,6 +146,8 @@ pub struct LoadedMcpConfig {
     pub servers: Vec<McpServerDefinition>,
     pub loaded_files: Vec<PathBuf>,
     pub skipped_project_file: Option<PathBuf>,
+    pub global_config: Option<PathBuf>,
+    pub project_config: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -151,13 +156,54 @@ struct McpConfigFile {
     servers: BTreeMap<String, McpServerConfig>,
 }
 
-/// 加载用户级配置，并在显式信任时让项目级配置覆盖同名 Server。
-pub fn load_default(trust_project: bool) -> Result<LoadedMcpConfig> {
-    let global = std::env::var_os("HOME")
+/// TUI 默认加载项目配置；`--no-project-mcp` 或 `ASTERIA_NO_PROJECT_MCP` 可关闭。
+pub fn project_config_trusted(deny: bool) -> bool {
+    project_config_trusted_with(deny, std::env::var_os("ASTERIA_NO_PROJECT_MCP").is_some())
+}
+
+fn project_config_trusted_with(deny: bool, env_deny: bool) -> bool {
+    !deny && !env_deny
+}
+
+/// 从当前目录向上查找 `.asteria/mcp.json`，找不到再用编译时的仓库路径。
+pub fn discover_project_config(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+    loop {
+        let candidate = dir.join(".asteria").join("mcp.json");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn default_project_config() -> Option<PathBuf> {
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(found) = discover_project_config(&cwd)
+    {
+        return Some(found);
+    }
+    let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".asteria")
+        .join("mcp.json");
+    compiled.is_file().then_some(compiled)
+}
+
+fn default_global_config() -> Option<PathBuf> {
+    std::env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|home| home.join(".asteria/mcp.json"));
-    let project = std::env::current_dir()?.join(".asteria/mcp.json");
-    load_from_paths(global.as_deref(), Some(&project), trust_project)
+        .map(|home| home.join(".asteria/mcp.json"))
+}
+
+/// 加载用户级配置，并在信任时让项目级配置覆盖同名 Server。
+pub fn load_default(trust_project: bool) -> Result<LoadedMcpConfig> {
+    load_from_paths(
+        default_global_config().as_deref(),
+        default_project_config().as_deref(),
+        trust_project,
+    )
 }
 
 fn load_from_paths(
@@ -191,6 +237,8 @@ fn load_from_paths(
         servers: merged.into_values().collect(),
         loaded_files,
         skipped_project_file,
+        global_config: global.map(Path::to_path_buf),
+        project_config: project.map(Path::to_path_buf),
     })
 }
 
@@ -280,6 +328,28 @@ mod tests {
     }
 
     #[test]
+    fn discovers_project_config_from_nested_directory() {
+        let dir = temp_dir();
+        let nested = dir.join("src").join("bin");
+        fs::create_dir_all(dir.join(".asteria")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        let config = dir.join(".asteria/mcp.json");
+        fs::write(&config, r#"{"mcpServers":{}}"#).unwrap();
+        assert_eq!(
+            discover_project_config(&nested),
+            Some(config.canonicalize().unwrap())
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn project_config_trusted_defaults_on_unless_denied() {
+        assert!(project_config_trusted_with(false, false));
+        assert!(!project_config_trusted_with(true, false));
+        assert!(!project_config_trusted_with(false, true));
+    }
+
+    #[test]
     fn project_config_requires_explicit_trust_and_overrides_global() {
         let dir = temp_dir();
         let global = dir.join("global.json");
@@ -348,6 +418,16 @@ mod tests {
         let local: McpServerConfig =
             serde_json::from_str(r#"{"url":"http://localhost:8080/mcp"}"#).unwrap();
         local.validate_transport().unwrap();
+    }
+
+    #[test]
+    fn parses_oauth_client_id_for_remote_servers() {
+        let config: McpServerConfig = serde_json::from_str(
+            r#"{"url":"https://agent.binance.com/mcp/agentic","oauthClientId":"grok"}"#,
+        )
+        .unwrap();
+        config.validate_transport().unwrap();
+        assert_eq!(config.oauth_client_id.as_deref(), Some("grok"));
     }
 
     #[test]

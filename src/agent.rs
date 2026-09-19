@@ -11,8 +11,8 @@ use crate::{
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 
-const SYSTEM: &str = "你是 Asteria，一个可靠、简洁的中文 AI 助手。核心工具包括 Read、Write、Edit、Glob、Grep、Bash、calculate 和 current_time；读取或修改工作区时应调用对应工具，不要声称完成未实际执行的操作。mcp__* 是配置后才会出现的可选扩展工具。";
-const RAG_HINT: &str = "本地知识库已启用：只有查询 docs/rag-docs 中的手册、章节或知识资料时使用 search_docs；查看普通工作区文件时使用 Read、Glob 或 Grep。询问知识库第N章/目录/章节内容时，把用户原问题作为 query。以最新 search_docs 结果为准，资料不足时明确说不知道，不要编造。";
+const SYSTEM: &str = "你是 Asteria，一个可靠、简洁的中文 AI 助手。核心工具包括 Read、Write、Edit、Glob、Grep、Bash、calculate 和 current_time；读取或修改工作区时应调用对应工具，不要声称完成未实际执行的操作。mcp__* 是配置后才会出现的可选扩展工具。用户提到登录或使用 GitHub 时，若已有 mcp__github__* 工具，直接调用它们（身份来自环境变量 GITHUB_TOKEN，例如先用 get_me 确认账号）；不要索要密码、验证码或浏览器登录，也不要说自己无法访问 GitHub。只有这些工具未注册或调用失败时，才说明需要在 .env 中配置 GITHUB_TOKEN。用户提到 Binance、币安、行情或交易时，若已有 mcp__binance-mcp-server__* 工具，直接调用它们；不要索要 Binance API Key。下单、撤单和子账户内转账会先征求批准；Agent 无法出金。";
+const RAG_HINT: &str = "本地知识库已启用：查询 docs/rag-docs 中的手册、troubleshooting、章节或 LT 故障时必须调用 search_docs，不要用 Bash/Read 去解压或通读 docx。查看普通工作区源码时使用 Read、Glob 或 Grep。询问知识库第N章/目录/章节内容时，把用户原问题作为 query。以最新 search_docs 结果为准，资料不足时明确说不知道，不要编造。";
 
 /// 对外提供简单问答接口，并组合上下文与 Agent Loop。
 pub struct Asteria {
@@ -173,8 +173,43 @@ impl Asteria {
         trust_project: bool,
         server_name: &str,
     ) -> Result<()> {
+        self.replace_mcp_server(trust_project, server_name, true)
+            .await
+    }
+
+    /// 打开浏览器完成 OAuth 后连接指定 MCP Server。
+    pub async fn authorize_mcp_server(
+        &mut self,
+        trust_project: bool,
+        server_name: &str,
+    ) -> Result<()> {
+        crate::mcp::clear_oauth_credentials(server_name)?;
+        self.replace_mcp_server(trust_project, server_name, true)
+            .await
+    }
+
+    /// 删除已保存的 OAuth 凭据，并断开该 Server。
+    pub async fn logout_mcp_server(&mut self, server_name: &str) -> Result<()> {
+        crate::mcp::clear_oauth_credentials(server_name)?;
+        match self.disconnect_mcp_server(server_name).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.to_string().contains("未知 MCP Server") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn replace_mcp_server(
+        &mut self,
+        trust_project: bool,
+        server_name: &str,
+        interactive: bool,
+    ) -> Result<()> {
         let result = async {
-            let loaded = crate::mcp::load_named(trust_project, server_name).await?;
+            let loaded = if interactive {
+                crate::mcp::load_named_interactive(trust_project, server_name).await?
+            } else {
+                crate::mcp::load_named(trust_project, server_name).await?
+            };
             if loaded.manager.has_blocking_failures() {
                 anyhow::bail!(
                     "MCP Server `{server_name}` 连接失败：{}",

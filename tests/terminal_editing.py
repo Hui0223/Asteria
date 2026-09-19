@@ -33,6 +33,8 @@ class Terminal:
         environment = dict(os.environ, TERM="xterm-256color")
         self.session_dir = Path(tempfile.mkdtemp(prefix="asteria-tui-test-"))
         environment["ASTERIA_SESSION_PATH"] = str(self.session_dir)
+        environment["ASTERIA_NO_PROJECT_MCP"] = "1"
+        environment["ASTERIA_NO_RAG"] = "1"
         environment.update(env_overrides or {})
 
         def controlling_terminal():
@@ -57,15 +59,8 @@ class Terminal:
         return self.screen.display[self.screen.cursor.y].rstrip()
 
     def at_prompt(self, text=""):
-        """编辑态把 User 放在方框第一行，输入落在下一行。"""
-        expected = "│ " + text
-        row = self.screen.cursor.y
-        return (
-            self.line().startswith(expected)
-            and row > 1
-            and "User" in self.screen.display[row - 1]
-            and self.screen.display[row - 2].lstrip().startswith("╭")
-        )
+        """空闲时单行 User 提示，输入紧跟在标签后面。"""
+        return self.line() == f"User：{text}".rstrip()
 
     def send(self, text):
         """一次性写入整段 UTF-8 和控制键，覆盖中文连输/粘贴场景。"""
@@ -94,8 +89,10 @@ class Terminal:
         start = len(self.raw)
         self.send("\r")
         self.wait(lambda: output in self.raw[start:] and self.at_prompt())
-        assert "│ User" in self.raw[start:]
-        assert "╰" in self.raw[start:]
+        assert f"› {command}" in self.raw[start:], self.raw[start:]
+        assert any(command in line for line in self.screen.display), (
+            "提交后的命令回显被后续输出擦掉了：\n" + "\n".join(self.screen.display)
+        )
         assert "[处理中]" not in self.raw[start:], "命令残留前缀，误发给模型"
 
     def close(self):

@@ -98,7 +98,7 @@ impl LiveAnswer {
         }
         let mut lines = Vec::new();
         if !self.header_shown {
-            lines.push("Asteria".into());
+            lines.push("\nAsteria".into());
             self.header_shown = true;
         }
         self.streamed = true;

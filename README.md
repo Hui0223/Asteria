@@ -26,6 +26,15 @@ cargo run --release
 
 输入 `/context` 查看原始记忆，`/usage` 查看最近 Turn 与会话累计用量，`/trace` 查看最近 Turn 的脱敏工具审计，`/trace <turn_id>` 查询指定 Turn，`/mcp status` 查看 MCP Server 状态，`/reset` 清空记忆（保留用量统计），`/exit` 退出。
 
+独立聊天窗口不依赖 Cursor，会弹出自己的桌面窗口并拉起 `asteria-agent --rpc`：
+
+```bash
+cargo build --bin asteria-agent
+cargo run --bin asteria-app
+```
+
+终端 TUI 仍是 `cargo run`。Cursor 侧栏是可选入口，见 `extensions/asteria/README.md`。
+
 ## 核心文件系统与 Shell 工具
 
 文件系统能力属于 Asteria 内置工具，不依赖 MCP Server：
@@ -58,18 +67,25 @@ MCP 只用于额外接入第三方工具，不承担 Asteria 核心文件能力�
     "cloudflare-docs": {
       "url": "https://docs.mcp.cloudflare.com/mcp",
       "toolTimeoutMs": 30000
+    },
+    "binance-mcp-server": {
+      "url": "https://agent.binance.com/mcp/agentic",
+      "oauthClientId": "grok",
+      "toolTimeoutMs": 30000
     }
   }
 }
 ```
 
-每个 Server 必须且只能配置 `command` 或 `url`。`${workspaceFolder}` 会在 stdio 的 `args` 和 `cwd` 中解析为 Asteria 启动目录；`env` 和远程 `headers` 支持 `${NAME}` 环境变量引用。远程 URL 必须使用 HTTPS，只有 localhost 允许 HTTP。`Authorization` 必须写成 `"Bearer ${TOKEN_NAME}"`，明文 Token 会被拒绝，解析后的敏感值不会写入 Schema、TUI 或 ToolTrace。`enabledTools` 省略时允许发现到的全部工具；`disabledTools` 始终优先。
+每个 Server 必须且只能配置 `command` 或 `url`。`${workspaceFolder}` 会在 stdio 的 `args` 和 `cwd` 中解析为 Asteria 启动目录；`env` 和远程 `headers` 支持 `${NAME}` 环境变量引用。远程 URL 必须使用 HTTPS，只有 localhost 允许 HTTP。`Authorization` 必须写成 `"Bearer ${TOKEN_NAME}"`，明文 Token 会被拒绝，解析后的敏感值不会写入 Schema、TUI 或 ToolTrace。需要浏览器 OAuth 的远程 Server 可设置 `oauthClientId`；凭据保存在用户目录，不进入 mcp.json。`enabledTools` 省略时允许发现到的全部工具；`disabledTools` 始终优先。
 
-项目配置中的同名 Server 会覆盖用户配置。由于 stdio 配置会直接启动子进程，项目配置默认不执行；确认信任仓库后使用：
+项目配置中的同名 Server 会覆盖用户配置。TUI 默认加载当前工作区的 `.asteria/mcp.json`；工具仍默认 `ask`，调用前会征求批准。若当前仓库不可信，可跳过项目配置：
 
 ```bash
-cargo run --release -- --trust-project-mcp
+cargo run --release -- --no-project-mcp
 ```
+
+空闲时也可用 `/mcp trust` 加载项目配置，或 `/mcp untrust` 重新跳过。`--trust-project-mcp` 仍被接受，但已不再需要。测试可设置 `ASTERIA_NO_PROJECT_MCP=1`，避免连上本机项目里的 Server。
 
 远端工具以 `mcp__<server>__<tool>` 注册，避免和核心工具重名，默认权限为 `ask`。可以先用 `/mcp` 和 `/permissions` 检查，再批准单次调用或用 `/permission mcp__external__tool_name allow` 修改会话权限。权限保存在 `state.json`，调用的脱敏审计保存在 `trace.jsonl`。
 
@@ -78,16 +94,20 @@ MCP 配置和连接支持在 TUI 空闲状态动态管理：
 ```text
 /mcp status
 /mcp tools
+/mcp trust
+/mcp untrust
 /mcp reload
 /mcp connect external
 /mcp disconnect external
+/mcp auth binance-mcp-server
+/mcp logout binance-mcp-server
 ```
 
 `reload` 会从磁盘重新读取用户级和受信任的项目级配置，先建立完整候选连接；所有启用的 Server 均可用后才整体替换当前连接，失败时旧连接和工具保持不变。`connect` 只验证并替换指定 Server，`disconnect` 会关闭子进程并立即从模型 Schema 中注销其工具。同名工具在重载时继承当前权限，已删除工具的过期权限会从 `state.json` 清理；每次生命周期操作的成功或失败均写入 `trace.jsonl`，不会进入模型上下文。
 
 MCP 原始 Tool Result 只在当前 Turn 生成答案时可见，随后从 `ContextMemory` 和 `context.jsonl` 中移除；后续上下文保留用户问题与最终回答，审计仍保留工具名、脱敏参数、结果哈希、状态和耗时。所有工具结果还受 Registry 的 8000 字符上限约束，图片、音频和二进制资源不会把 Base64 数据注入模型上下文。
 
-当前支持 stdio 和 Streamable HTTP Tools，包括无会话的远程 Server、HTTP Header、Bearer Token、独立启动/调用超时和会话过期重建。需要交互式 OAuth 的 Server 会显示 `auth_required`；OAuth 2.1 登录、Resources 和 Prompts 留待后续阶段。
+当前支持 stdio 和 Streamable HTTP Tools，包括无会话的远程 Server、HTTP Header、Bearer Token、OAuth 2.1 PKCE 登录、独立启动/调用超时和会话过期重建。需要浏览器登录的 Server 会显示 `auth_required`；输入 `/mcp auth <server>` 或 `/mcp connect <server>` 会打开系统浏览器完成授权。OAuth 凭据保存在 `~/.asteria/oauth/<server>.json`，权限为 `0600`，不会写入会话或 ToolTrace。`oauthClientId` 用于 Binance 这类只接受预注册客户端的服务；未设置时依次尝试 Client ID Metadata Document 和 Dynamic Client Registration。Resources 和 Prompts 留待后续阶段。
 
 项目示例配置还包含四组常用只读远程工具：
 
@@ -95,6 +115,7 @@ MCP 原始 Tool Result 只在当前 Turn 生成答案时可见，随后从 `Cont
 - DeepWiki：`ask_question`、`read_wiki_structure`、`read_wiki_contents`，读取公开 GitHub 仓库的结构化知识。
 - Microsoft Learn：`microsoft_docs_search`、`microsoft_code_sample_search`、`microsoft_docs_fetch`，检索微软官方文档与代码示例。
 - GitHub：`get_me`、`get_file_contents`、`search_code`、`issue_read`、`pull_request_read`，通过官方远程 MCP 只读访问账号与仓库信息。启动前在 `.env` 或进程环境中设置最小权限的 `GITHUB_TOKEN`；配置不会接受明文 Token。
+- Binance MCP Server：`https://agent.binance.com/mcp/agentic`，通过 OAuth 连接官方 Agentic 子账户，可读行情、查余额，并在你确认后交易 Spot / Margin / Convert / 合约或在子账户钱包之间划转。没有出金权限。首次使用输入 `/mcp auth binance-mcp-server`，在桌面浏览器登录 Binance 并授权；资金需你在 Binance 网页手动转入 Agentic 子账户。交易与划转工具默认 `ask`。
 
 这些 Server 均使用 Streamable HTTP 且无需本地 Node.js。示例配置通过 `enabledTools` 固定允许列表，避免远端新增工具后未经审查自动进入模型 Schema。`fixture` 只用于协议回归测试，不属于生产工具。
 
@@ -144,7 +165,7 @@ python3 tests/permission_tui.py
 
 脚本需要 `tests/requirements-terminal.txt` 中的依赖；验证批准、拒绝、取消后过期编号无效，以及 reset 不清除权限。
 
-交互终端由 Reedline 把每次用户输入绘制在自适应终端宽度的消息框内：第一行是 `User`，下一行是问题正文，编辑时即显示顶边与左右边框，提交后闭合底边。DeepSeek 以 SSE 推送 `assistant.delta`；TUI 合并换行或约 80 字后按行刷新 `Asteria` 回答，Reedline 无法在同一行逐 token 重绘。增量事件不写入 `trace.jsonl`。输入框支持中文宽度、退格、左右移动、跨行和粘贴。回答、排队提示、重试日志出现时，会输出在输入框上方并恢复尚未提交的草稿。默认使用紧凑事件视图：隐藏 Step、call ID 和重复权限日志，工具结束时合并为一行，每轮回答后只显示一行 Step、Token、重试和耗时摘要；完整统计仍由 `/usage` 提供。输入 `/verbose on` 可临时恢复详细 AgentEvent，`/verbose off` 返回紧凑模式。输入历史只保存在内存，不自动写历史文件。
+交互终端由 Reedline 使用单行 `User：` 提示接收输入：问题和标签都以加粗亮绿色显示，提交后只保留一行，并在 `Asteria` 回答前空一行。斜杠命令回显为 `› /command`，不套用问题样式。DeepSeek 以 SSE 推送 `assistant.delta`；TUI 合并换行或约 80 字后按行刷新 `Asteria` 回答，Reedline 无法在同一行逐 token 重绘。增量事件不写入 `trace.jsonl`。输入行支持中文宽度、退格、左右移动、跨行和粘贴。回答、排队提示、重试日志出现时，会输出在输入行上方并恢复尚未提交的草稿。默认使用紧凑事件视图：隐藏 Step、call ID 和重复权限日志，工具结束时合并为一行，每轮回答后只显示一行 Step、Token、重试和耗时摘要；完整统计仍由 `/usage` 提供。输入 `/verbose on` 可临时恢复详细 AgentEvent，`/verbose off` 返回紧凑模式。输入历史只保存在内存，不自动写历史文件。
 
 等待回答期间仍可输入，收到普通输入后显示 `[已排队]` 和待处理条数。当前轮结束后显示 `[开始处理排队输入]` 及对应内容，再按顺序执行；空行不排队。`/cancel` 立即取消当前轮，其余输入（包括 `/context`、`/usage`、`/trace`、`/reset`、`/exit`）按队列顺序处理。取消当前轮不会清空已排队的输入。管道、重定向或 `TERM=dumb` 使用纯文本模式，不启用光标编辑。
 

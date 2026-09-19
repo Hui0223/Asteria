@@ -1,13 +1,15 @@
 use super::{
     config::{LoadedMcpConfig, McpServerDefinition},
+    oauth::{FileCredentialStore, authorize_in_browser},
     tool::{McpToolAdapter, namespaced_tool_name},
 };
 use anyhow::{Context, Result};
 use rmcp::{
-    RoleClient, ServiceExt,
+    RmcpError, RoleClient, ServiceExt,
     service::RunningService,
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
+        auth::{AuthClient, AuthorizationManager},
         streamable_http_client::{
             AuthRequiredError, InsufficientScopeError, StreamableHttpClientTransportConfig,
         },
@@ -41,6 +43,12 @@ impl std::fmt::Display for McpServerState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OAuthFlow {
+    StoredOnly,
+    InteractiveIfRequired,
+}
+
 #[derive(Clone, Debug)]
 pub struct McpServerStatus {
     pub name: String,
@@ -55,6 +63,8 @@ pub struct McpManager {
     statuses: Vec<McpServerStatus>,
     loaded_files: Vec<PathBuf>,
     skipped_project_file: Option<PathBuf>,
+    global_config: Option<PathBuf>,
+    project_config: Option<PathBuf>,
 }
 
 pub struct McpLoadResult {
@@ -63,8 +73,15 @@ pub struct McpLoadResult {
 }
 
 impl McpManager {
-    /// 连接全部启用的 stdio Server；单个 Server 失败不会阻止其他 Server。
+    /// 连接全部启用的 Server；单个 Server 失败不会阻止其他 Server。
     pub async fn connect(config: LoadedMcpConfig) -> McpLoadResult {
+        Self::connect_with_oauth(config, OAuthFlow::StoredOnly).await
+    }
+
+    pub(crate) async fn connect_with_oauth(
+        config: LoadedMcpConfig,
+        oauth: OAuthFlow,
+    ) -> McpLoadResult {
         let mut connections = BTreeMap::new();
         let mut statuses = Vec::new();
         let mut adapters = Vec::new();
@@ -81,7 +98,7 @@ impl McpManager {
                 continue;
             }
             let connected = if definition.config.url.is_some() {
-                connect_http_server(&definition).await
+                connect_http_server(&definition, oauth).await
             } else {
                 connect_stdio_server(&definition).await
             };
@@ -136,6 +153,8 @@ impl McpManager {
                 statuses,
                 loaded_files: config.loaded_files,
                 skipped_project_file: config.skipped_project_file,
+                global_config: config.global_config,
+                project_config: config.project_config,
             },
             tools: adapters,
         }
@@ -153,17 +172,22 @@ impl McpManager {
         self.skipped_project_file.as_deref()
     }
 
+    pub fn global_config(&self) -> Option<&std::path::Path> {
+        self.global_config.as_deref()
+    }
+
+    pub fn project_config(&self) -> Option<&std::path::Path> {
+        self.project_config.as_deref()
+    }
+
     pub fn active_connections(&self) -> usize {
         self.connections.len()
     }
 
     pub fn has_blocking_failures(&self) -> bool {
-        self.statuses.iter().any(|status| {
-            matches!(
-                status.state,
-                McpServerState::AuthRequired | McpServerState::Failed
-            )
-        })
+        self.statuses
+            .iter()
+            .any(|status| status.state == McpServerState::Failed)
     }
 
     pub fn failure_summary(&self) -> String {
@@ -226,7 +250,13 @@ impl McpManager {
             .with_context(|| format!("候选配置中没有 MCP Server: {server_name}"))?;
         anyhow::ensure!(
             new_status.state == McpServerState::Connected,
-            "MCP Server `{server_name}` 未连接成功"
+            "MCP Server `{server_name}` 未连接成功（{}{}）",
+            new_status.state,
+            new_status
+                .detail
+                .as_ref()
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default()
         );
         let new_connection = candidate
             .connections
@@ -243,6 +273,8 @@ impl McpManager {
             .sort_by(|left, right| left.name.cmp(&right.name));
         self.loaded_files = candidate.loaded_files;
         self.skipped_project_file = candidate.skipped_project_file;
+        self.global_config = candidate.global_config;
+        self.project_config = candidate.project_config;
         Ok(())
     }
 
@@ -256,6 +288,7 @@ impl McpManager {
 
 async fn connect_http_server(
     definition: &McpServerDefinition,
+    oauth: OAuthFlow,
 ) -> Result<(RunningService<RoleClient, ()>, Vec<rmcp::model::Tool>)> {
     let url = definition
         .config
@@ -267,8 +300,70 @@ async fn connect_http_server(
         StreamableHttpClientTransportConfig::with_uri(url).custom_headers(custom_headers);
     if let Some(token) = bearer_token {
         config = config.auth_header(token);
+        return handshake_http(
+            definition,
+            StreamableHttpClientTransport::from_config(config),
+        )
+        .await;
     }
-    let transport = StreamableHttpClientTransport::from_config(config);
+
+    match connect_http_with_stored_oauth(definition, config.clone()).await {
+        Ok(connected) => Ok(connected),
+        Err(error) if oauth == OAuthFlow::InteractiveIfRequired && is_auth_required(&error) => {
+            let manager = authorize_in_browser(
+                url,
+                &definition.name,
+                definition.config.oauth_client_id.as_deref(),
+                auth_challenge_from_error(&error).as_deref(),
+                |message| eprintln!("{message}"),
+            )
+            .await?;
+            handshake_authorized(definition, config, manager).await
+        }
+        Err(error) => Err(annotate_auth_required(definition, error)),
+    }
+}
+
+async fn connect_http_with_stored_oauth(
+    definition: &McpServerDefinition,
+    config: StreamableHttpClientTransportConfig,
+) -> Result<(RunningService<RoleClient, ()>, Vec<rmcp::model::Tool>)> {
+    let url = definition
+        .config
+        .url
+        .as_deref()
+        .context("Streamable HTTP MCP Server 缺少 url")?;
+    let mut manager = AuthorizationManager::new(url)
+        .await
+        .with_context(|| format!("无法初始化 MCP Server `{}` 的 OAuth", definition.name))?;
+    if let Some(store) = FileCredentialStore::for_server(&definition.name) {
+        manager.set_credential_store(store);
+        let _ = manager.initialize_from_store().await;
+    }
+    handshake_authorized(definition, config, manager).await
+}
+
+async fn handshake_authorized(
+    definition: &McpServerDefinition,
+    config: StreamableHttpClientTransportConfig,
+    manager: AuthorizationManager,
+) -> Result<(RunningService<RoleClient, ()>, Vec<rmcp::model::Tool>)> {
+    let client = AuthClient::new(mcp_http_client()?, manager);
+    handshake_http(
+        definition,
+        StreamableHttpClientTransport::with_client(client, config),
+    )
+    .await
+}
+
+async fn handshake_http<T, E, A>(
+    definition: &McpServerDefinition,
+    transport: T,
+) -> Result<(RunningService<RoleClient, ()>, Vec<rmcp::model::Tool>)>
+where
+    T: rmcp::transport::IntoTransport<RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
     let startup_timeout = Duration::from_millis(definition.config.startup_timeout_ms);
     let service = tokio::time::timeout(startup_timeout, ().serve(transport))
         .await
@@ -279,6 +374,50 @@ async fn connect_http_server(
         .with_context(|| format!("MCP Server `{}` tools/list 超时", definition.name))?
         .with_context(|| format!("MCP Server `{}` tools/list 失败", definition.name))?;
     Ok((service, tools))
+}
+
+fn mcp_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("无法创建 MCP HTTP 客户端")
+}
+
+fn annotate_auth_required(definition: &McpServerDefinition, error: anyhow::Error) -> anyhow::Error {
+    if is_auth_required(&error) {
+        error.context(format!(
+            "MCP Server `{}` 需要浏览器登录，输入 /mcp auth {}",
+            definition.name, definition.name
+        ))
+    } else {
+        error
+    }
+}
+
+fn is_auth_required(error: &anyhow::Error) -> bool {
+    auth_challenge_from_error(error).is_some()
+        || error.chain().any(|cause| {
+            cause.downcast_ref::<AuthRequiredError>().is_some()
+                || cause.downcast_ref::<InsufficientScopeError>().is_some()
+        })
+}
+
+fn auth_challenge_from_error(error: &anyhow::Error) -> Option<String> {
+    for cause in error.chain() {
+        if let Some(required) = cause.downcast_ref::<AuthRequiredError>() {
+            return Some(required.www_authenticate_header.clone());
+        }
+        if let Some(scope) = cause.downcast_ref::<InsufficientScopeError>() {
+            return Some(scope.www_authenticate_header.clone());
+        }
+        if let Some(RmcpError::ClientInitialize(initialize)) = cause.downcast_ref::<RmcpError>()
+            && let Some(challenge) = initialize.auth_challenge()
+        {
+            return Some(challenge.to_owned());
+        }
+    }
+    None
 }
 
 async fn connect_stdio_server(
@@ -359,8 +498,7 @@ mod tests {
                 "off",
                 r#"{"command":"missing","enabled":false}"#,
             )],
-            loaded_files: Vec::new(),
-            skipped_project_file: None,
+            ..Default::default()
         };
         let loaded = McpManager::connect(config).await;
         assert!(loaded.tools.is_empty());
@@ -374,6 +512,11 @@ mod tests {
             "Bearer resource_metadata=https://example.com".into(),
         ));
         assert_eq!(connection_error_state(&error), McpServerState::AuthRequired);
+        assert_eq!(
+            auth_challenge_from_error(&error).as_deref(),
+            Some("Bearer resource_metadata=https://example.com")
+        );
+        assert!(is_auth_required(&error));
     }
 
     #[tokio::test]
@@ -400,8 +543,7 @@ mod tests {
         };
         let loaded = McpManager::connect(LoadedMcpConfig {
             servers: vec![definition],
-            loaded_files: Vec::new(),
-            skipped_project_file: None,
+            ..Default::default()
         })
         .await;
 
@@ -437,8 +579,7 @@ mod tests {
         );
         let loaded = McpManager::connect(LoadedMcpConfig {
             servers: vec![remote],
-            loaded_files: Vec::new(),
-            skipped_project_file: None,
+            ..Default::default()
         })
         .await;
 
@@ -473,8 +614,7 @@ mod tests {
         );
         let loaded = McpManager::connect(LoadedMcpConfig {
             servers: vec![remote],
-            loaded_files: Vec::new(),
-            skipped_project_file: None,
+            ..Default::default()
         })
         .await;
         assert_eq!(loaded.manager.active_connections(), 1);

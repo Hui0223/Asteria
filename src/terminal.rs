@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
-use reedline::{ExternalPrinter, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
+use nu_ansi_term::{Color, Style};
+use reedline::{
+    ExternalPrinter, Highlighter, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal,
+    StyledText,
+};
 use std::{
     borrow::Cow,
     io::{self, IsTerminal, Write},
@@ -51,10 +55,11 @@ impl Output {
     }
 }
 
-/// 统一输入编辑与后台输出；交互模式把用户问题画在 User 消息框里。
+/// 统一输入编辑与后台输出；交互模式用加粗绿色显示用户问题。
 pub struct Terminal {
     pub input: async_channel::UnboundedReceiver<InputEvent>,
     pub output: Output,
+    busy: Option<Arc<AtomicBool>>,
 }
 
 impl Terminal {
@@ -67,6 +72,7 @@ impl Terminal {
         if interactive {
             let printer = ExternalPrinter::<String>::new(64);
             let active = Arc::new(AtomicBool::new(true));
+            let busy = Arc::new(AtomicBool::new(true));
             let (out_sender, out_receiver) = mpsc::channel();
             let output = Output {
                 sender: Some(out_sender),
@@ -77,14 +83,19 @@ impl Terminal {
                 .name("asteria-output".into())
                 .spawn(move || print_messages(out_receiver, output_printer, output_active))
                 .context("无法启动终端输出线程")?;
+            let editor_busy = busy.clone();
             if let Err(error) = std::thread::Builder::new()
                 .name("asteria-editor".into())
-                .spawn(move || read_edited(printer, active, sender))
+                .spawn(move || read_edited(printer, active, editor_busy, sender))
             {
                 output.finish();
                 return Err(error).context("无法启动终端编辑线程");
             }
-            Ok(Self { input, output })
+            Ok(Self {
+                input,
+                output,
+                busy: Some(busy),
+            })
         } else {
             std::thread::Builder::new()
                 .name("asteria-stdin".into())
@@ -93,6 +104,7 @@ impl Terminal {
             Ok(Self {
                 input,
                 output: Output::default(),
+                busy: None,
             })
         }
     }
@@ -100,6 +112,13 @@ impl Terminal {
     /// 输入编辑已结束后刷新最终输出。
     pub fn finish(&self) {
         self.output.finish();
+    }
+
+    /// 处理中改用省略号提示，避免流式输出打断正在编辑的输入行。
+    pub fn set_busy(&self, busy: bool) {
+        if let Some(flag) = &self.busy {
+            flag.store(busy, Ordering::Release);
+        }
     }
 }
 
@@ -111,29 +130,22 @@ fn print_messages(
 ) {
     while let Ok(event) = receiver.recv() {
         match event {
-            OutputEvent::Text(text) => {
-                // Reedline 只擦输入行；多行 User 框的顶边和标签要先清掉，避免残影。
-                let mut text = format!(
-                    "{}{text}",
-                    "\x1b[1A\r\x1b[2K".repeat(LIVE_PROMPT_DECORATION_ROWS)
-                );
-                loop {
-                    if !active.load(Ordering::Acquire) {
-                        while let Some(queued) = printer.get_line() {
-                            write_plain(&queued);
-                        }
-                        write_plain(&text);
-                        break;
+            OutputEvent::Text(mut text) => loop {
+                if !active.load(Ordering::Acquire) {
+                    while let Some(queued) = printer.get_line() {
+                        write_plain(&queued);
                     }
-                    match printer
-                        .sender()
-                        .send_timeout(text, Duration::from_millis(20))
-                    {
-                        Ok(()) => break,
-                        Err(error) => text = error.into_inner(),
-                    }
+                    write_plain(&text);
+                    break;
                 }
-            }
+                match printer
+                    .sender()
+                    .send_timeout(text, Duration::from_millis(20))
+                {
+                    Ok(()) => break,
+                    Err(error) => text = error.into_inner(),
+                }
+            },
             OutputEvent::Finish(done) => {
                 while let Some(queued) = printer.get_line() {
                     write_plain(&queued);
@@ -149,16 +161,24 @@ fn print_messages(
 fn read_edited(
     printer: ExternalPrinter<String>,
     active: Arc<AtomicBool>,
+    busy: Arc<AtomicBool>,
     sender: async_channel::UnboundedSender<InputEvent>,
 ) {
     let mut editor = Reedline::create()
-        .with_ansi_colors(false)
+        .with_ansi_colors(true)
+        .with_highlighter(Box::new(UserInputHighlighter))
         .with_external_printer(printer);
     let final_event = loop {
-        let prompt = UserPrompt::for_terminal();
+        let prompt = UserPrompt::for_terminal(busy.clone());
         match editor.read_line(&prompt) {
             Ok(Signal::Success(line)) => {
-                replace_submitted_prompt(&line);
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    echo_submitted(&line, busy.load(Ordering::Acquire));
+                    if !trimmed.starts_with('/') {
+                        busy.store(true, Ordering::Release);
+                    }
+                }
                 if line.trim() == "/exit" {
                     break Some(InputEvent::Line(line));
                 }
@@ -209,28 +229,45 @@ fn write_plain(text: &str) {
     let _ = writeln!(io::stdout().lock(), "{text}");
 }
 
-/// 顶边和 `User` 标签各占一行，输入落在第三行。
-const LIVE_PROMPT_DECORATION_ROWS: usize = 2;
-const USER_LABEL: &str = "User";
+const USER_PROMPT: &str = "User：";
+const BUSY_PROMPT: &str = "… ";
 
-/// 编辑态即显示完整 User 消息框；提交后再补底边。
+fn user_question_style() -> Style {
+    Style::new().bold().fg(Color::LightGreen)
+}
+
+/// 把正在输入的问题画成加粗亮绿色；斜杠命令保持默认颜色。
+struct UserInputHighlighter;
+
+impl Highlighter for UserInputHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        let mut styled = StyledText::new();
+        let style = if line.trim_start().starts_with('/') {
+            Style::new()
+        } else {
+            user_question_style()
+        };
+        styled.push((style, line.to_string()));
+        styled
+    }
+}
+
+/// 空闲时单行 `User` 提示；处理中收成省略号。
 struct UserPrompt {
-    box_width: usize,
+    busy: Arc<AtomicBool>,
 }
 
 impl UserPrompt {
-    fn for_terminal() -> Self {
-        Self {
-            box_width: prompt_box_width(terminal_columns()),
-        }
+    fn for_terminal(busy: Arc<AtomicBool>) -> Self {
+        Self { busy }
     }
 
     fn left_prompt(&self) -> String {
-        format!(
-            "{}\n{}\n│ ",
-            box_top(self.box_width),
-            box_row(USER_LABEL, self.box_width)
-        )
+        if self.busy.load(Ordering::Acquire) {
+            BUSY_PROMPT.into()
+        } else {
+            USER_PROMPT.into()
+        }
     }
 }
 
@@ -240,7 +277,7 @@ impl Prompt for UserPrompt {
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Borrowed("│ ")
+        Cow::Borrowed("")
     }
 
     fn render_prompt_indicator(&self, _: PromptEditMode) -> Cow<'_, str> {
@@ -248,21 +285,25 @@ impl Prompt for UserPrompt {
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
-        Cow::Borrowed("│ ")
+        Cow::Borrowed("  ")
     }
 
     /// 历史搜索提示，仅使用内存历史。
     fn render_prompt_history_search_indicator(&self, _: PromptHistorySearch) -> Cow<'_, str> {
-        Cow::Borrowed("│ 搜索: ")
+        Cow::Borrowed("搜索: ")
     }
 
-    fn right_prompt_on_last_line(&self) -> bool {
-        true
+    fn get_prompt_color(&self) -> Color {
+        Color::LightGreen
+    }
+
+    fn get_indicator_color(&self) -> Color {
+        Color::LightGreen
     }
 }
 
-/// 清除 Reedline 刚提交的普通提示行，并在同一位置绘制完整问题框。
-fn replace_submitted_prompt(line: &str) {
+/// 问题回显为加粗绿色单行；斜杠命令仍用 `›`，避免批准过程再套一层标签。
+fn echo_submitted(line: &str, busy: bool) {
     let (columns, rows) = terminal_size::terminal_size()
         .map(
             |(terminal_size::Width(columns), terminal_size::Height(rows))| {
@@ -270,102 +311,56 @@ fn replace_submitted_prompt(line: &str) {
             },
         )
         .unwrap_or((80, 24));
-    let submitted_rows = submitted_screen_rows(line, columns).min(rows.saturating_sub(1).max(1));
-    let message = render_user_box(line, columns);
+    let (erase_rows, message) = submitted_echo(line, columns, busy);
+    let erase_rows = erase_rows.min(rows.saturating_sub(1).max(1));
 
     let mut stdout = io::stdout().lock();
-    for _ in 0..submitted_rows {
+    for _ in 0..erase_rows {
         let _ = write!(stdout, "\x1b[1A\r\x1b[2K");
     }
     let _ = writeln!(stdout, "{message}");
     let _ = stdout.flush();
 }
 
-fn render_user_box(line: &str, columns: usize) -> String {
-    let box_width = prompt_box_width(columns);
-    let inner_width = box_inner_width(box_width);
-    let mut message = format!(
-        "{}\n{}\n",
-        box_top(box_width),
-        box_row(USER_LABEL, box_width)
-    );
-    for content in wrap_for_box(line, inner_width) {
-        message.push_str(&box_row(&content, box_width));
-        message.push('\n');
+fn submitted_echo(line: &str, columns: usize, busy: bool) -> (usize, String) {
+    let trimmed = line.trim();
+    let prefix_width = if busy {
+        unicode_width::UnicodeWidthStr::width(BUSY_PROMPT)
+    } else {
+        unicode_width::UnicodeWidthStr::width(USER_PROMPT)
+    };
+    let erase_rows = submitted_screen_rows(line, prefix_width, columns);
+    if trimmed.starts_with('/') {
+        (erase_rows, format!("› {trimmed}"))
+    } else {
+        (erase_rows, format!("{}\n", render_user_question(trimmed)))
     }
-    message.push_str(&box_bottom(box_width));
-    message
 }
 
-fn terminal_columns() -> usize {
-    terminal_size::terminal_size()
-        .map(|(terminal_size::Width(columns), _)| usize::from(columns))
-        .unwrap_or(80)
+fn render_user_question(line: &str) -> String {
+    user_question_style()
+        .paint(format!("{USER_PROMPT}{}", sanitize_user_text(line)))
+        .to_string()
 }
 
-fn prompt_box_width(columns: usize) -> usize {
-    columns.saturating_sub(1).max(10)
+fn sanitize_user_text(line: &str) -> String {
+    line.chars()
+        .filter(|character| *character == '\n' || !character.is_control())
+        .map(|character| if character == '\t' { ' ' } else { character })
+        .collect()
 }
 
-fn box_inner_width(box_width: usize) -> usize {
-    box_width.saturating_sub(4).max(1)
-}
-
-fn box_top(box_width: usize) -> String {
-    format!("╭{}╮", "─".repeat(box_width.saturating_sub(2)))
-}
-
-fn box_bottom(box_width: usize) -> String {
-    format!("╰{}╯", "─".repeat(box_width.saturating_sub(2)))
-}
-
-fn box_row(content: &str, box_width: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
-
-    let inner_width = box_inner_width(box_width);
-    let padding = inner_width.saturating_sub(UnicodeWidthStr::width(content));
-    format!("│ {content}{} │", " ".repeat(padding))
-}
-
-fn wrap_for_box(line: &str, width: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthChar;
-
-    let mut lines = vec![String::new()];
-    let mut current_width = 0usize;
-    for character in line.chars() {
-        if character == '\n' {
-            lines.push(String::new());
-            current_width = 0;
-            continue;
-        }
-        let replacement = if character == '\t' { ' ' } else { character };
-        if replacement.is_control() {
-            continue;
-        }
-        let character_width = UnicodeWidthChar::width(replacement).unwrap_or(0);
-        if current_width + character_width > width && !lines.last().unwrap().is_empty() {
-            lines.push(String::new());
-            current_width = 0;
-        }
-        lines.last_mut().unwrap().push(replacement);
-        current_width += character_width;
-    }
-    lines
-}
-
-fn submitted_screen_rows(line: &str, columns: usize) -> usize {
+fn submitted_screen_rows(line: &str, prefix_width: usize, columns: usize) -> usize {
     use unicode_width::UnicodeWidthStr;
 
     let columns = columns.max(1);
-    LIVE_PROMPT_DECORATION_ROWS
-        + line
-            .split('\n')
-            .map(|part| {
-                let width = 2 + UnicodeWidthStr::width(part);
-                width.saturating_sub(1) / columns + 1
-            })
-            .sum::<usize>()
-            .max(1)
+    line.split('\n')
+        .map(|part| {
+            let width = prefix_width + UnicodeWidthStr::width(part);
+            width.saturating_sub(1) / columns + 1
+        })
+        .sum::<usize>()
+        .max(1)
 }
 
 #[cfg(test)]
@@ -374,40 +369,60 @@ mod tests {
 
     #[test]
     fn submitted_row_count_handles_chinese_and_wrapping() {
-        assert_eq!(submitted_screen_rows("中文", 20), 3);
-        assert_eq!(submitted_screen_rows(&"中".repeat(8), 20), 3);
-        assert_eq!(submitted_screen_rows("first\nsecond", 20), 4);
+        let prefix = unicode_width::UnicodeWidthStr::width(USER_PROMPT);
+        assert_eq!(submitted_screen_rows("中文", prefix, 20), 1);
+        assert_eq!(submitted_screen_rows(&"中".repeat(8), prefix, 20), 2);
+        assert_eq!(submitted_screen_rows("first\nsecond", prefix, 20), 2);
     }
 
     #[test]
-    fn live_prompt_puts_user_inside_the_box() {
-        use unicode_width::UnicodeWidthStr;
-
-        let prompt = UserPrompt { box_width: 16 };
-        let left = prompt.left_prompt();
-        let lines: Vec<_> = left.lines().collect();
-        assert_eq!(lines[0], "╭──────────────╮");
-        assert_eq!(lines[1], "│ User         │");
-        assert_eq!(lines[2], "│ ");
-        assert!(lines.iter().all(|line| UnicodeWidthStr::width(*line) <= 16));
+    fn live_prompt_is_a_single_user_line() {
+        let prompt = UserPrompt {
+            busy: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(prompt.left_prompt(), "User：");
+        assert_eq!(prompt.get_prompt_color(), Color::LightGreen);
     }
 
     #[test]
-    fn user_box_wraps_chinese_and_drops_control_sequences() {
-        use unicode_width::UnicodeWidthStr;
+    fn busy_prompt_collapses_to_a_single_line() {
+        let prompt = UserPrompt {
+            busy: Arc::new(AtomicBool::new(true)),
+        };
+        assert_eq!(prompt.left_prompt(), "… ");
+    }
 
-        let box_text = render_user_box("中文问题中文问题\x1b[31m", 24);
-        assert!(!box_text.contains('\x1b'));
-        assert!(
-            box_text
-                .lines()
-                .all(|line| UnicodeWidthStr::width(line) <= 23)
+    #[test]
+    fn user_question_is_bold_green_and_drops_control_sequences() {
+        let painted = render_user_question("中文问题中文问题\x1b[31m");
+        assert!(!painted.contains('╭'));
+        assert!(!painted.contains('│'));
+        assert_eq!(
+            painted,
+            user_question_style()
+                .paint("User：中文问题中文问题[31m")
+                .to_string()
         );
-        let lines: Vec<_> = box_text.lines().collect();
-        assert!(lines[0].starts_with('╭'));
-        assert!(lines[1].starts_with("│ User"));
-        assert!(lines[1].ends_with('│'));
-        assert!(lines[2].contains("中文问题"));
-        assert!(box_text.ends_with('╯'));
+    }
+
+    #[test]
+    fn slash_commands_are_not_styled_as_user_questions() {
+        let command = submitted_echo("/approve 1", 80, true).1;
+        assert_eq!(command, "› /approve 1");
+        assert!(!command.contains("User"));
+        let question = submitted_echo("LT 反复重启", 80, false).1;
+        assert!(question.contains("User"));
+        assert!(question.contains("LT 反复重启"));
+        assert!(!question.contains('╭'));
+        assert!(question.contains("\x1b["));
+        assert!(question.ends_with('\n'), "问题与后续输出之间应空一行");
+    }
+
+    #[test]
+    fn highlighter_paints_questions_green_and_leaves_slash_commands_plain() {
+        let question = UserInputHighlighter.highlight("LT 反复重启", 0);
+        assert_eq!(question.buffer[0].0, user_question_style());
+        let command = UserInputHighlighter.highlight("/approve 1", 0);
+        assert_eq!(command.buffer[0].0, Style::new());
     }
 }
