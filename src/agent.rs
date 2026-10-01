@@ -6,7 +6,7 @@ use crate::{
     provider::TokenUsage,
     provider::deepseek::DeepSeekProvider,
     rag::{RagStore, SearchDocsTool, source_refs_from_outputs},
-    session::SessionStore,
+    session::{SessionCatalog, SessionHub, SessionStore},
 };
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ const RAG_HINT: &str = "本地知识库已启用：查询 docs/rag-docs 中的�
 pub struct Asteria {
     agent_loop: AgentLoop<DeepSeekProvider>,
     context: ContextMemory,
-    session: std::sync::Arc<SessionStore>,
+    session_hub: SessionHub,
     restored_permissions: Vec<(String, ToolPermission)>,
     mcp_manager: Option<crate::mcp::McpManager>,
 }
@@ -26,14 +26,14 @@ pub struct Asteria {
 impl Asteria {
     /// 根据环境变量创建 DeepSeek Agent，并采用默认 Loop 配置。
     pub fn new() -> Result<Self> {
-        let session = std::sync::Arc::new(SessionStore::from_env()?);
-        let restored = session.restore(SYSTEM)?;
+        let session_hub = SessionHub::from_env()?;
+        let restored = session_hub.store().restore(SYSTEM)?;
         let mut context = restored.context;
         context.compact_tool_exchanges_since(0, "search_docs")?;
         context.compact_tool_exchanges_with_prefix_since(0, "mcp__")?;
         let mut agent_loop = AgentLoop::new(DeepSeekProvider::from_env()?, LoopConfig::default());
         agent_loop.restore_session_state(restored.next_turn_id, restored.usage);
-        let persistent_events = std::sync::Arc::new(session.event_sink());
+        let persistent_events = std::sync::Arc::new(session_hub.event_sink());
         agent_loop.set_event_sink(QueuedEventSink::new(vec![persistent_events]));
         for (tool, permission) in &restored.permissions {
             agent_loop.set_tool_permission(tool, *permission).ok();
@@ -41,10 +41,14 @@ impl Asteria {
         Ok(Self {
             agent_loop,
             context,
-            session,
+            session_hub,
             restored_permissions: restored.permissions,
             mcp_manager: None,
         })
+    }
+
+    fn store(&self) -> std::sync::Arc<SessionStore> {
+        self.session_hub.store()
     }
 
     /// 返回当前 Agent 使用的模型名称。
@@ -69,7 +73,7 @@ impl Asteria {
         permission: crate::permission::ToolPermission,
     ) -> Result<()> {
         self.agent_loop.set_tool_permission(name, permission)?;
-        self.session.append_permission(name, permission)
+        self.store().append_permission(name, permission)
     }
 
     /// 获取工具权限列表。
@@ -155,7 +159,7 @@ impl Asteria {
                     .register_tool_with_permission(tool, permission);
             }
             let old = self.mcp_manager.replace(loaded.manager);
-            self.session
+            self.store()
                 .replace_permissions(&self.agent_loop.tool_permissions())?;
             if let Some(old) = old {
                 old.shutdown().await;
@@ -248,7 +252,7 @@ impl Asteria {
                 self.agent_loop
                     .register_tool_with_permission(tool, permission);
             }
-            self.session
+            self.store()
                 .replace_permissions(&self.agent_loop.tool_permissions())
         }
         .await;
@@ -267,7 +271,7 @@ impl Asteria {
             for name in tools {
                 self.agent_loop.unregister_tool(&name);
             }
-            self.session
+            self.store()
                 .replace_permissions(&self.agent_loop.tool_permissions())
         }
         .await;
@@ -278,7 +282,7 @@ impl Asteria {
     fn record_mcp_lifecycle(&self, action: &str, server: Option<&str>, result: &Result<()>) {
         let detail = result.as_ref().err().map(|error| format!("{error:#}"));
         if let Err(error) =
-            self.session
+            self.store()
                 .append_mcp_lifecycle(action, server, result.is_ok(), detail.as_deref())
         {
             eprintln!("MCP 生命周期审计持久化失败: {error:#}");
@@ -292,7 +296,7 @@ impl Asteria {
 
     /// 注入事件接收器，供 TUI、Transcript 和评估系统订阅执行过程。
     pub fn set_event_sink(&mut self, sink: std::sync::Arc<dyn crate::events::EventSink>) {
-        let persistent = std::sync::Arc::new(self.session.event_sink());
+        let persistent = std::sync::Arc::new(self.session_hub.event_sink());
         let persistent_queue = QueuedEventSink::new(vec![persistent]);
         self.agent_loop
             .set_event_sink(std::sync::Arc::new(FanoutEventSink {
@@ -311,32 +315,58 @@ impl Asteria {
     }
 
     /// 返回当前 JSONL 会话文件路径。
-    pub fn session_path(&self) -> &std::path::Path {
-        self.session.path()
+    pub fn session_path(&self) -> std::path::PathBuf {
+        self.store().path().to_path_buf()
     }
 
     /// 返回会话目录及 context、trace、state 三个文件路径。
-    pub fn session_paths(&self) -> &crate::session::SessionPaths {
-        self.session.paths()
+    pub fn session_paths(&self) -> crate::session::SessionPaths {
+        self.store().paths().clone()
+    }
+
+    /// 当前会话目录、标题和可切换列表。
+    pub fn session_catalog(&self) -> SessionCatalog {
+        self.session_hub.catalog(self.context.messages().len())
     }
 
     /// 读取全部或指定 Turn 的脱敏工具审计记录。
     pub fn tool_traces(&self, turn_id: Option<u64>) -> Result<Vec<crate::events::ToolTrace>> {
-        self.session.tool_traces(turn_id)
+        self.store().tool_traces(turn_id)
     }
 
-    /// 创建新的空会话，同时清空内存、持久化记录和累计 Token。
-    pub fn new_session(&mut self) -> Result<()> {
-        self.context.reset();
-        self.session.clear()?;
+    /// 创建新的空会话并切换过去，旧会话目录保留。
+    pub fn new_session(&mut self) -> Result<SessionCatalog> {
+        self.session_hub.create()?;
+        self.adopt_current_session()
+    }
+
+    /// 切换到已有会话并恢复其上下文。
+    pub fn switch_session(&mut self, id: &str) -> Result<SessionCatalog> {
+        self.session_hub.switch_to(id)?;
+        self.adopt_current_session()
+    }
+
+    fn adopt_current_session(&mut self) -> Result<SessionCatalog> {
+        let system = self.context.system_prompt().to_owned();
+        let restored = self.store().restore(&system)?;
+        let mut context = restored.context;
+        context.compact_tool_exchanges_since(0, "search_docs")?;
+        context.compact_tool_exchanges_with_prefix_since(0, "mcp__")?;
+        self.context = context;
         self.agent_loop.reset_session_state();
-        Ok(())
+        self.agent_loop
+            .restore_session_state(restored.next_turn_id, restored.usage);
+        self.restored_permissions = restored.permissions.clone();
+        for (tool, permission) in &restored.permissions {
+            self.agent_loop.set_tool_permission(tool, *permission).ok();
+        }
+        Ok(self.session_catalog())
     }
 
-    /// 清空对话历史，但保留 Agent 的系统设定。
+    /// 清空当前会话的对话历史，但保留会话目录和其他会话。
     pub fn reset(&mut self) {
         self.context.reset();
-        if let Err(error) = self.session.clear() {
+        if let Err(error) = self.store().clear() {
             eprintln!("清空会话持久化失败: {error:#}");
         }
     }
@@ -371,7 +401,7 @@ impl Asteria {
                 eprintln!("MCP 上下文压缩失败（本轮仍已完成）: {error:#}");
             }
             if let Some(turn) = self.agent_loop.last_turn()
-                && let Err(error) = self.session.append_turn_with_audit(
+                && let Err(error) = self.store().append_turn_with_audit(
                     &self.context.messages()[before..],
                     turn.id,
                     &turn.usage,
@@ -382,9 +412,14 @@ impl Asteria {
                 eprintln!("会话持久化失败（本轮仍已完成）: {error:#}");
             }
         } else if let Some(turn) = self.agent_loop.last_turn()
-            && let Err(error) = self.session.append_tool_traces(&turn.tool_traces)
+            && let Err(error) = self.store().append_tool_traces(&turn.tool_traces)
         {
             eprintln!("失败 Turn 的工具审计持久化失败: {error:#}");
+        }
+        if result.is_ok()
+            && let Err(error) = self.session_hub.remember_user_input(input)
+        {
+            eprintln!("更新会话标题失败: {error:#}");
         }
         result
     }

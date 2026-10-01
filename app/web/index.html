@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>Asteria</title>
+  <style>/*APP_CSS*/</style>
+</head>
+<body>
+  <div id="shell">
+    <aside id="rail">
+      <div id="rail-title">Sessions</div>
+      <div id="session-list"></div>
+      <button id="new-chat" type="button">+ New chat</button>
+    </aside>
+    <main id="main">
+      <header id="header">
+        <div id="title-wrap">
+          <span id="title">Asteria</span>
+          <span id="model-wrap"><span class="dot"></span><span id="model">connecting</span></span>
+        </div>
+        <div id="pills">
+          <span id="rag-pill" class="pill">RAG</span>
+          <span id="mcp-pill" class="pill">MCP</span>
+        </div>
+      </header>
+      <div id="log"></div>
+      <div id="composer">
+        <input id="input" placeholder="继续提问，或输入 /session /new-session /usage ..." />
+        <button id="send" aria-label="发送">➤</button>
+      </div>
+    </main>
+  </div>
+  <script>/*APP_JS*/</script>
+</body>
+</html>

@@ -18,6 +18,10 @@ use std::{
 const CONTEXT_FILE: &str = "context.jsonl";
 const TRACE_FILE: &str = "trace.jsonl";
 const STATE_FILE: &str = "state.json";
+const INDEX_FILE: &str = "index.json";
+const DEFAULT_HUB: &str = ".asteria/sessions";
+const LEGACY_SINGLE: &str = ".asteria/session";
+const DEFAULT_TITLE: &str = "新对话";
 
 /// 旧版单文件会话格式，仅用于无损迁移。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -125,24 +129,9 @@ pub struct RestoredSession {
 }
 
 impl SessionStore {
-    /// 根据 ASTERIA_SESSION_PATH 创建会话目录，默认使用 .asteria/session/。
-    ///
-    /// 兼容旧配置：若变量值以 .jsonl 结尾，则将同名无扩展路径作为新目录，
-    /// 并自动迁移原单文件日志。
+    /// 打开环境中的当前会话。多会话目录请使用 [`SessionHub::from_env`]。
     pub fn from_env() -> Result<Self> {
-        let configured = std::env::var("ASTERIA_SESSION_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(".asteria/session"));
-        let (directory, legacy_path) = if configured.extension().is_some_and(|ext| ext == "jsonl") {
-            (configured.with_extension(""), configured)
-        } else {
-            let legacy_path = configured.with_extension("jsonl");
-            (configured, legacy_path)
-        };
-        let store = Self::at(directory)?;
-        store.migrate_legacy(&legacy_path)?;
-        store.ensure_layout()?;
-        Ok(store)
+        Ok((*SessionHub::from_env()?.store()).clone())
     }
 
     fn at(directory: PathBuf) -> Result<Self> {
@@ -281,7 +270,7 @@ impl SessionStore {
     /// 创建将事件写入该会话文件的 EventSink。
     pub fn event_sink(self: &std::sync::Arc<Self>) -> PersistentEventSink {
         PersistentEventSink {
-            store: self.clone(),
+            store: LiveStore::new((**self).clone()),
         }
     }
 
@@ -417,7 +406,7 @@ impl SessionStore {
         Ok(())
     }
 
-    /// 清空上下文、审计和状态文件，供 /reset 与 /new-session 使用。
+    /// 清空当前会话目录中的上下文、审计和状态，供 /reset 使用。
     pub fn clear(&self) -> Result<()> {
         let _guard = self.lock()?;
         truncate_file(&self.paths.context)?;
@@ -506,18 +495,414 @@ impl SessionStore {
     }
 }
 
-/// 将执行事件写入 SessionStore 的持久化接收器。
+/// 将执行事件写入当前会话目录的持久化接收器。
 pub struct PersistentEventSink {
-    store: std::sync::Arc<SessionStore>,
+    store: LiveStore,
 }
 
 impl EventSink for PersistentEventSink {
     /// 事件持久化失败只记录错误，不阻断当前 Turn。
     fn publish(&self, event: AgentEvent) {
-        if let Err(error) = self.store.append_agent_event(&event) {
+        if let Err(error) = self.store.get().append_agent_event(&event) {
             eprintln!("事件持久化失败: {error:#}");
         }
     }
+}
+
+/// 可在切换会话时替换底层目录，供事件线程始终写入当前会话。
+#[derive(Clone)]
+struct LiveStore {
+    inner: Arc<Mutex<Arc<SessionStore>>>,
+}
+
+impl LiveStore {
+    fn new(store: SessionStore) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Arc::new(store))),
+        }
+    }
+
+    fn get(&self) -> Arc<SessionStore> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn replace(&self, store: SessionStore) {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(store);
+    }
+}
+
+/// 侧栏和 `/session` 展示用的一条会话摘要。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 当前会话及目录快照，供 TUI、RPC 和独立 App 使用。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SessionCatalog {
+    pub current_id: String,
+    pub current_title: String,
+    pub message_count: usize,
+    pub sessions: Vec<SessionSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SessionIndex {
+    version: u32,
+    current_id: String,
+    sessions: Vec<SessionSummary>,
+}
+
+/// 管理 `.asteria/sessions/<id>/` 与根目录 `index.json`。
+pub struct SessionHub {
+    root: PathBuf,
+    index: SessionIndex,
+    live: LiveStore,
+}
+
+impl SessionHub {
+    /// 打开或创建多会话目录；默认 `.asteria/sessions/`。
+    ///
+    /// `ASTERIA_SESSION_PATH` 视为会话根目录。旧的 `.asteria/session/`
+    /// 三文件布局会复制到新目录下的第一条会话。
+    pub fn from_env() -> Result<Self> {
+        let plan = resolve_hub_plan();
+        Self::open(plan)
+    }
+
+    fn open(plan: HubPlan) -> Result<Self> {
+        fs::create_dir_all(&plan.root).context("无法创建会话根目录")?;
+        if plan.root.join(INDEX_FILE).is_file() {
+            let mut hub = Self::load(plan.root)?;
+            hub.ensure_current_store(plan.legacy_jsonl.as_deref())?;
+            return Ok(hub);
+        }
+        if looks_like_session_dir(&plan.root) {
+            let id = adopt_session_files(&plan.root)?;
+            let store = open_store(plan.root.join(&id), plan.legacy_jsonl.as_deref())?;
+            let index = index_with_current(id, Some(title_from_restored(&store)));
+            let hub = Self {
+                live: LiveStore::new(store),
+                root: plan.root,
+                index,
+            };
+            hub.save_index()?;
+            return Ok(hub);
+        }
+        if let Some(legacy_dir) = plan.migrate_from.as_ref() {
+            let id = copy_session_dir(legacy_dir, &plan.root)?;
+            let store = open_store(plan.root.join(&id), plan.legacy_jsonl.as_deref())?;
+            let index = index_with_current(id, Some(title_from_restored(&store)));
+            let hub = Self {
+                live: LiveStore::new(store),
+                root: plan.root,
+                index,
+            };
+            hub.save_index()?;
+            return Ok(hub);
+        }
+        let id = new_session_id();
+        let store = open_store(plan.root.join(&id), plan.legacy_jsonl.as_deref())?;
+        let hub = Self {
+            live: LiveStore::new(store),
+            root: plan.root,
+            index: index_with_current(id, None),
+        };
+        hub.save_index()?;
+        Ok(hub)
+    }
+
+    fn load(root: PathBuf) -> Result<Self> {
+        let raw = fs::read_to_string(root.join(INDEX_FILE)).context("无法读取会话索引")?;
+        let mut index: SessionIndex = serde_json::from_str(&raw).context("无法解析会话索引")?;
+        if index.sessions.is_empty() {
+            let id = new_session_id();
+            index = index_with_current(id, None);
+        }
+        if !index
+            .sessions
+            .iter()
+            .any(|item| item.id == index.current_id)
+        {
+            index.current_id = index.sessions[0].id.clone();
+        }
+        let store = open_store(root.join(&index.current_id), None)?;
+        Ok(Self {
+            live: LiveStore::new(store),
+            root,
+            index,
+        })
+    }
+
+    fn ensure_current_store(&mut self, legacy_jsonl: Option<&Path>) -> Result<()> {
+        let store = open_store(self.root.join(&self.index.current_id), legacy_jsonl)?;
+        self.live.replace(store);
+        Ok(())
+    }
+
+    /// 当前会话的持久化目录。
+    pub fn store(&self) -> Arc<SessionStore> {
+        self.live.get()
+    }
+
+    /// 创建写入当前会话的 EventSink；切换会话后无需重新注入。
+    pub fn event_sink(&self) -> PersistentEventSink {
+        PersistentEventSink {
+            store: self.live.clone(),
+        }
+    }
+
+    pub fn current_id(&self) -> &str {
+        &self.index.current_id
+    }
+
+    pub fn current_title(&self) -> &str {
+        self.index
+            .sessions
+            .iter()
+            .find(|item| item.id == self.index.current_id)
+            .map(|item| item.title.as_str())
+            .unwrap_or(DEFAULT_TITLE)
+    }
+
+    pub fn list(&self) -> Vec<SessionSummary> {
+        let mut sessions = self.index.sessions.clone();
+        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        sessions
+    }
+
+    pub fn catalog(&self, message_count: usize) -> SessionCatalog {
+        SessionCatalog {
+            current_id: self.current_id().to_owned(),
+            current_title: self.current_title().to_owned(),
+            message_count,
+            sessions: self.list(),
+        }
+    }
+
+    /// 新建空会话并切换过去，保留旧目录。
+    pub fn create(&mut self) -> Result<Arc<SessionStore>> {
+        let id = new_session_id();
+        let store = open_store(self.root.join(&id), None)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        self.index.sessions.push(SessionSummary {
+            id: id.clone(),
+            title: DEFAULT_TITLE.into(),
+            created_at: now.clone(),
+            updated_at: now,
+        });
+        self.index.current_id = id;
+        self.live.replace(store);
+        self.save_index()?;
+        Ok(self.store())
+    }
+
+    /// 按完整 id 或唯一前缀切换到已有会话。
+    pub fn switch_to(&mut self, query: &str) -> Result<Arc<SessionStore>> {
+        let id = resolve_session_id(&self.index, query)?.to_owned();
+        if id == self.index.current_id {
+            return Ok(self.store());
+        }
+        let store = open_store(self.root.join(&id), None)?;
+        self.index.current_id = id;
+        self.touch(None);
+        self.live.replace(store);
+        self.save_index()?;
+        Ok(self.store())
+    }
+
+    /// 用本轮用户输入更新标题（仅当仍是默认标题），并刷新时间。
+    pub fn remember_user_input(&mut self, input: &str) -> Result<()> {
+        let title = title_from_input(input);
+        self.touch(Some(&title));
+        self.save_index()
+    }
+
+    fn touch(&mut self, title: Option<&str>) {
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Some(session) = self
+            .index
+            .sessions
+            .iter_mut()
+            .find(|item| item.id == self.index.current_id)
+        {
+            session.updated_at = now;
+            if let Some(title) = title
+                && (session.title.is_empty() || session.title == DEFAULT_TITLE)
+            {
+                session.title = title.to_owned();
+            }
+        }
+    }
+
+    fn save_index(&self) -> Result<()> {
+        let temporary = self.root.join(".index.json.tmp");
+        let mut file = File::create(&temporary)?;
+        serde_json::to_writer_pretty(&mut file, &self.index)?;
+        file.write_all(b"\n")?;
+        file.sync_data()?;
+        fs::rename(&temporary, self.root.join(INDEX_FILE))?;
+        Ok(())
+    }
+}
+
+struct HubPlan {
+    root: PathBuf,
+    legacy_jsonl: Option<PathBuf>,
+    migrate_from: Option<PathBuf>,
+}
+
+fn resolve_hub_plan() -> HubPlan {
+    if let Ok(configured) = std::env::var("ASTERIA_SESSION_PATH") {
+        let configured = PathBuf::from(configured);
+        if configured.extension().is_some_and(|ext| ext == "jsonl") {
+            return HubPlan {
+                root: configured.with_extension(""),
+                legacy_jsonl: Some(configured),
+                migrate_from: None,
+            };
+        }
+        let maybe_jsonl = configured.with_extension("jsonl");
+        return HubPlan {
+            legacy_jsonl: maybe_jsonl.is_file().then_some(maybe_jsonl),
+            root: configured,
+            migrate_from: None,
+        };
+    }
+    let root = PathBuf::from(DEFAULT_HUB);
+    let old = PathBuf::from(LEGACY_SINGLE);
+    let migrate_from =
+        (!root.join(INDEX_FILE).is_file() && looks_like_session_dir(&old)).then_some(old);
+    HubPlan {
+        root,
+        legacy_jsonl: None,
+        migrate_from,
+    }
+}
+
+fn looks_like_session_dir(path: &Path) -> bool {
+    path.join(CONTEXT_FILE).is_file()
+        || path.join(STATE_FILE).is_file()
+        || path.join(TRACE_FILE).is_file()
+}
+
+fn open_store(directory: PathBuf, legacy_jsonl: Option<&Path>) -> Result<SessionStore> {
+    let store = SessionStore::at(directory)?;
+    if let Some(legacy) = legacy_jsonl {
+        store.migrate_legacy(legacy)?;
+    }
+    store.ensure_layout()?;
+    Ok(store)
+}
+
+fn adopt_session_files(root: &Path) -> Result<String> {
+    let id = new_session_id();
+    let dest = root.join(&id);
+    fs::create_dir_all(&dest).context("无法创建会话目录")?;
+    for name in [CONTEXT_FILE, TRACE_FILE, STATE_FILE] {
+        let source = root.join(name);
+        if source.is_file() {
+            fs::rename(&source, dest.join(name))
+                .with_context(|| format!("无法将 {} 迁移到多会话目录", source.display()))?;
+        }
+    }
+    Ok(id)
+}
+
+fn copy_session_dir(source: &Path, root: &Path) -> Result<String> {
+    let id = new_session_id();
+    let dest = root.join(&id);
+    fs::create_dir_all(&dest).context("无法创建会话目录")?;
+    for name in [CONTEXT_FILE, TRACE_FILE, STATE_FILE] {
+        let file = source.join(name);
+        if file.is_file() {
+            fs::copy(&file, dest.join(name))
+                .with_context(|| format!("无法复制旧会话文件 {}", file.display()))?;
+        }
+    }
+    Ok(id)
+}
+
+fn index_with_current(id: String, title: Option<String>) -> SessionIndex {
+    let now = chrono::Utc::now().to_rfc3339();
+    SessionIndex {
+        version: 1,
+        current_id: id.clone(),
+        sessions: vec![SessionSummary {
+            title: title
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| DEFAULT_TITLE.into()),
+            id,
+            created_at: now.clone(),
+            updated_at: now,
+        }],
+    }
+}
+
+fn resolve_session_id<'a>(index: &'a SessionIndex, query: &str) -> Result<&'a str> {
+    let query = query.trim();
+    if query.is_empty() {
+        anyhow::bail!("请提供会话 id，例如 /session {}", index.current_id);
+    }
+    if let Some(session) = index.sessions.iter().find(|item| item.id == query) {
+        return Ok(session.id.as_str());
+    }
+    let matches: Vec<_> = index
+        .sessions
+        .iter()
+        .filter(|item| item.id.starts_with(query))
+        .collect();
+    match matches.as_slice() {
+        [session] => Ok(session.id.as_str()),
+        [] => anyhow::bail!("没有匹配 `{query}` 的会话，输入 /session 查看列表"),
+        _ => anyhow::bail!("`{query}` 匹配到多个会话，请使用更完整的 id"),
+    }
+}
+
+fn new_session_id() -> String {
+    let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    format!("s{stamp}-{:04x}", nanos & 0xffff)
+}
+
+fn title_from_input(input: &str) -> String {
+    let trimmed = input.trim();
+    let mut title: String = trimmed.chars().take(32).collect();
+    if trimmed.chars().count() > 32 {
+        title.push('…');
+    }
+    if title.is_empty() {
+        DEFAULT_TITLE.into()
+    } else {
+        title
+    }
+}
+
+fn title_from_restored(store: &SessionStore) -> String {
+    let Ok(restored) = store.restore("") else {
+        return DEFAULT_TITLE.into();
+    };
+    restored
+        .context
+        .messages()
+        .iter()
+        .find_map(|message| match message {
+            Message::User { content } => Some(title_from_input(content)),
+            _ => None,
+        })
+        .unwrap_or_else(|| DEFAULT_TITLE.into())
 }
 
 /// 序列化一行 JSONL 记录。
@@ -961,5 +1346,96 @@ mod tests {
         );
         let _ = fs::remove_dir_all(directory);
         let _ = fs::remove_file(legacy_path);
+    }
+
+    fn test_hub_root() -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("asteria-session-hub-{id}"))
+    }
+
+    #[test]
+    fn hub_creates_and_switches_without_clearing_old_session() {
+        let root = test_hub_root();
+        let mut hub = SessionHub::open(HubPlan {
+            root: root.clone(),
+            legacy_jsonl: None,
+            migrate_from: None,
+        })
+        .unwrap();
+        let first = hub.current_id().to_owned();
+        hub.store()
+            .append_turn(
+                &[Message::User {
+                    content: "first question".into(),
+                }],
+                1,
+                &TokenUsage {
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                    total_tokens: 4,
+                },
+            )
+            .unwrap();
+        hub.remember_user_input("first question").unwrap();
+
+        hub.create().unwrap();
+        let second = hub.current_id().to_owned();
+        assert_ne!(first, second);
+        assert!(
+            hub.store()
+                .restore("")
+                .unwrap()
+                .context
+                .messages()
+                .is_empty()
+        );
+
+        hub.switch_to(&first).unwrap();
+        let restored = hub.store().restore("").unwrap();
+        assert_eq!(
+            restored.context.messages(),
+            vec![Message::User {
+                content: "first question".into(),
+            }]
+        );
+        assert_eq!(hub.current_title(), "first question");
+        assert_eq!(hub.list().len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hub_adopts_legacy_single_session_directory() {
+        let root = test_hub_root();
+        fs::create_dir_all(&root).unwrap();
+        let store = SessionStore::at(root.clone()).unwrap();
+        store.ensure_layout().unwrap();
+        store
+            .append_turn(
+                &[Message::User {
+                    content: "legacy".into(),
+                }],
+                2,
+                &TokenUsage::default(),
+            )
+            .unwrap();
+
+        let hub = SessionHub::open(HubPlan {
+            root: root.clone(),
+            legacy_jsonl: None,
+            migrate_from: None,
+        })
+        .unwrap();
+        assert!(!root.join(CONTEXT_FILE).exists());
+        assert!(root.join(INDEX_FILE).is_file());
+        assert_eq!(
+            hub.store().restore("").unwrap().context.messages(),
+            vec![Message::User {
+                content: "legacy".into(),
+            }]
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

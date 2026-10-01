@@ -5,7 +5,7 @@ use asteria_agent::agent::Asteria;
 pub enum SlashAction {
     Context,
     Usage,
-    Session,
+    Session { target: Option<String> },
     Trace { command: String },
     Mcp { command: String },
     Permissions,
@@ -32,7 +32,13 @@ pub fn classify_slash(input: &str) -> Option<SlashAction> {
         ["/cancel"] => SlashAction::Cancel,
         ["/context"] => SlashAction::Context,
         ["/usage"] => SlashAction::Usage,
-        ["/session"] => SlashAction::Session,
+        ["/session"] => SlashAction::Session { target: None },
+        ["/session", id] => SlashAction::Session {
+            target: Some((*id).to_owned()),
+        },
+        command if command.first() == Some(&"/session") => SlashAction::Session {
+            target: command.get(1).map(|id| (*id).to_owned()),
+        },
         ["/new-session"] => SlashAction::NewSession,
         ["/reset"] => SlashAction::Reset,
         ["/permissions"] => SlashAction::Permissions,
@@ -107,14 +113,56 @@ pub fn format_usage(agent: &Asteria) -> String {
 }
 
 pub fn format_session(agent: &Asteria) -> String {
+    let catalog = agent.session_catalog();
     let paths = agent.session_paths();
-    format!(
-        "[Session]\n目录：{}\n上下文：{}\n审计：{}\n状态：{}",
-        paths.directory.display(),
-        paths.context.display(),
-        paths.trace.display(),
-        paths.state.display()
-    )
+    let mut lines = vec![
+        format!(
+            "[Session]\n当前：{}  {}",
+            catalog.current_id, catalog.current_title
+        ),
+        format!("目录：{}", paths.directory.display()),
+        format!("上下文：{}", paths.context.display()),
+        format!("审计：{}", paths.trace.display()),
+        format!("状态：{}", paths.state.display()),
+        String::new(),
+        "会话列表：".into(),
+    ];
+    for session in &catalog.sessions {
+        let marker = if session.id == catalog.current_id {
+            "*"
+        } else {
+            " "
+        };
+        lines.push(format!("{marker} {}  {}", session.id, session.title));
+    }
+    lines.push(String::new());
+    lines.push(
+        "用法：/session <id> 切换已有会话；/new-session 新建并切换（不会删除旧会话）。".into(),
+    );
+    lines.join("\n")
+}
+
+pub fn switch_session(agent: &mut Asteria, id: &str) -> String {
+    match agent.switch_session(id) {
+        Ok(catalog) => format!(
+            "[Session] 已切换到 {}（{}，{} 条消息）\n{}",
+            catalog.current_id,
+            catalog.current_title,
+            catalog.message_count,
+            format_session(agent)
+        ),
+        Err(error) => format!("切换会话失败: {error:#}"),
+    }
+}
+
+pub fn create_session(agent: &mut Asteria) -> String {
+    match agent.new_session() {
+        Ok(catalog) => format!(
+            "[Session] 已创建空会话 {}。旧会话仍保留，可用 /session 切回去。",
+            catalog.current_id
+        ),
+        Err(error) => format!("创建新会话失败: {error:#}"),
+    }
 }
 
 pub fn format_permissions(agent: &Asteria) -> String {
@@ -354,6 +402,16 @@ mod tests {
     fn classifies_tui_slash_commands() {
         assert_eq!(classify_slash("/reset"), Some(SlashAction::Reset));
         assert_eq!(classify_slash("/context"), Some(SlashAction::Context));
+        assert_eq!(
+            classify_slash("/session"),
+            Some(SlashAction::Session { target: None })
+        );
+        assert_eq!(
+            classify_slash("/session s20260920-1"),
+            Some(SlashAction::Session {
+                target: Some("s20260920-1".into())
+            })
+        );
         assert_eq!(
             classify_slash("/trace 3"),
             Some(SlashAction::Trace {

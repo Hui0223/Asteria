@@ -1,0 +1,38 @@
+{
+  "name": "asteria",
+  "displayName": "Asteria",
+  "description": "Asteria agent sidebar for Cursor and VS Code",
+  "version": "0.1.1",
+  "publisher": "asteria",
+  "engines": {
+    "vscode": "^1.86.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "type": "webview",
+          "id": "asteria.chat",
+          "name": "Asteria",
+          "visibility": "visible"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "asteria.focus",
+        "title": "打开 Asteria"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "asteria.focus",
+        "key": "ctrl+alt+a",
+        "mac": "cmd+alt+a"
+      }
+    ]
+  }
+}

@@ -1,0 +1,228 @@
+:root {
+  --bg: #141414;
+  --rail: #1b1b1b;
+  --panel: #252526;
+  --border: #3c3c3c;
+  --text: #cccccc;
+  --muted: #8b8b8b;
+  --green: #3ecf8e;
+  --blue: #0e639c;
+  --input: #3c3c3c;
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+#shell {
+  display: flex;
+  height: 100%;
+}
+
+#rail {
+  width: 220px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--rail);
+  border-right: 1px solid var(--border);
+  padding: 14px 10px;
+}
+#rail-title {
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  padding: 0 8px 10px;
+}
+.session, #new-chat {
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--text);
+  background: transparent;
+  cursor: pointer;
+}
+.session.active {
+  background: var(--panel);
+}
+#session-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.session {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#new-chat {
+  color: var(--muted);
+  margin-top: 8px;
+}
+
+#main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+#header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 18px 12px;
+  border-bottom: 1px solid var(--border);
+}
+#title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+#title { font-weight: 600; font-size: 15px; }
+#model-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--green);
+  font-size: 12px;
+}
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+}
+#model-wrap.offline .dot { background: #f48771; }
+#model-wrap.offline #model { color: #f48771; }
+#pills { display: flex; gap: 8px; }
+.pill {
+  color: var(--muted);
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 8px;
+}
+
+#log {
+  flex: 1;
+  overflow: auto;
+  padding: 16px 18px 12px;
+}
+
+.user, .tool, .approval, .answer {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 0 0 10px;
+}
+
+.user {
+  color: var(--green);
+  font-weight: 600;
+  border-color: rgba(62, 207, 142, 0.35);
+  background: rgba(62, 207, 142, 0.06);
+  white-space: pre-wrap;
+}
+.slash {
+  color: var(--muted);
+  margin: 0 0 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.command-result {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  white-space: pre-wrap;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: auto;
+}
+.status, .log, .error {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 0 10px;
+}
+.error { color: #f48771; }
+.tool {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.ok { color: var(--green); }
+.fail { color: #f48771; }
+.pending { color: #cca700; }
+.asteria-label {
+  font-weight: 600;
+  margin: 0 0 6px;
+}
+.assistant {
+  white-space: pre-wrap;
+  margin: 0;
+}
+.answer { padding-bottom: 12px; }
+
+.approval h3 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.approval .tool-name { color: var(--muted); margin-bottom: 8px; }
+.approval pre {
+  margin: 0 0 10px;
+  padding: 8px;
+  background: #1b1b1b;
+  border-radius: 4px;
+  overflow: auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+.row { display: flex; gap: 8px; }
+button {
+  border: 0;
+  border-radius: 6px;
+  padding: 6px 14px;
+  color: #fff;
+  cursor: pointer;
+}
+.allow { background: var(--blue); }
+.deny { background: #5a5a5a; }
+button:disabled { opacity: 0.5; cursor: default; }
+
+#composer {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px 16px;
+  border-top: 1px solid var(--border);
+}
+#input {
+  flex: 1;
+  border: 0;
+  border-radius: 8px;
+  background: var(--input);
+  color: var(--text);
+  padding: 10px 12px;
+  outline: none;
+}
+#send {
+  background: var(--blue);
+  min-width: 36px;
+  border-radius: 8px;
+}

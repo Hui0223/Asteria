@@ -121,16 +121,20 @@ MCP 原始 Tool Result 只在当前 Turn 生成答案时可见，随后从 `Cont
 
 模型请求经过动态 Tool Router：工作区只读发现工具、`calculate` 和 `current_time` 保持可见，写入/Shell 工具按代码修改意图加入；MCP 工具根据 Server 名、工具名、描述和用户问题评分，每个 Step 默认最多注入 8 个候选。用户明确点名的 MCP 工具和当前 Turn 已调用的工具始终保留，因此路由不会破坏强制调用或工具结果续步。Registry 仍保存全部工具并负责权限与执行，Router 只缩小发送给模型的 Schema，不会绕过审批。
 
-会话命令：`/session` 显示当前会话目录及三个持久化文件；`/new-session` 清空当前会话、重置 Turn 编号和 Session Token 统计，开始一个全新的会话。
+会话命令：`/session` 列出全部会话并显示当前目录；`/session <id>` 切换到已有会话并恢复其上下文；`/new-session` 新建空会话并切换过去，旧目录保留。`/reset` 仍只清空当前会话。独立 App 左侧栏绑定同一份列表。
 
-会话默认使用 `.asteria/session/`，也可以通过 `ASTERIA_SESSION_PATH` 指定目录：
+会话默认使用 `.asteria/sessions/`，也可以通过 `ASTERIA_SESSION_PATH` 指定根目录：
 
 ```text
-.asteria/session/
-├── context.jsonl  # 可恢复为 ContextMemory 的已完成 Turn 消息
-├── trace.jsonl    # AgentEvent、ToolTrace 和 RAG 来源审计
-└── state.json     # 格式版本、下一个 Turn ID、累计用量和工具权限
+.asteria/sessions/
+├── index.json              # 当前会话 id、标题和更新时间
+└── s20260920-153012-a1b2/
+    ├── context.jsonl       # 可恢复为 ContextMemory 的已完成 Turn 消息
+    ├── trace.jsonl         # AgentEvent、ToolTrace 和 RAG 来源审计
+    └── state.json          # 格式版本、下一个 Turn ID、累计用量和工具权限
 ```
+
+旧版 `.asteria/session/` 会在首次启动时复制为上述目录中的第一条会话。
 
 `context.jsonl` 是唯一用于恢复模型记忆的文件。普通工具 Turn 会保存完整消息；RAG Turn 只保存 User 与最终 Assistant，`search_docs` 正文不会进入后续上下文。未出现 `TurnCompleted` 的半批消息不会恢复。
 

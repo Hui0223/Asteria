@@ -94,11 +94,16 @@ async fn main() -> Result<()> {
             command if command.starts_with("/trace") => terminal
                 .output
                 .print(commands::format_trace(&agent, command)),
-            "/session" => terminal.output.print(commands::format_session(&agent)),
-            "/new-session" => match agent.new_session() {
-                Ok(()) => terminal.output.print("[Session] 已创建新的空会话。"),
-                Err(error) => terminal.output.print(format!("创建新会话失败: {error:#}")),
+            command if command.starts_with("/session") => match commands::classify_slash(command) {
+                Some(commands::SlashAction::Session { target: None }) => {
+                    terminal.output.print(commands::format_session(&agent));
+                }
+                Some(commands::SlashAction::Session { target: Some(id) }) => terminal
+                    .output
+                    .print(commands::switch_session(&mut agent, &id)),
+                _ => terminal.output.print(commands::format_session(&agent)),
             },
+            "/new-session" => terminal.output.print(commands::create_session(&mut agent)),
             "/reset" => {
                 agent.reset();
                 terminal.output.print("Asteria: 记忆已清空。");

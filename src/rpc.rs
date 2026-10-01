@@ -6,6 +6,7 @@ use asteria_agent::{
     agent_loop::{CancelToken, TurnState},
     events::{AgentEvent, EventSink},
     permission::{ApprovalRequest, ChannelApprover},
+    session::SessionSummary,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,11 +36,7 @@ pub async fn run(arguments: &[String]) -> Result<()> {
             text: format!("MCP 配置加载失败，Asteria 将继续启动：{error:#}"),
         });
     }
-    emit(&ClientEvent::Ready {
-        model: agent.model().to_owned(),
-        rag: boot::rag_label(rag_chunks),
-        mcp: boot::mcp_label(&agent),
-    });
+    emit_ready(&agent, rag_chunks);
 
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     tokio::spawn(read_commands(command_tx));
@@ -145,15 +142,15 @@ async fn handle_user_input(
     match action {
         SlashAction::Context => emit_result(commands::format_context(agent)),
         SlashAction::Usage => emit_result(commands::format_usage(agent)),
-        SlashAction::Session => emit_result(commands::format_session(agent)),
+        SlashAction::Session { target: None } => emit_result(commands::format_session(agent)),
+        SlashAction::Session { target: Some(id) } => {
+            emit_result(commands::switch_session(agent, &id));
+            emit_session_changed(agent, true);
+        }
         SlashAction::Trace { command } => emit_result(commands::format_trace(agent, &command)),
         SlashAction::Mcp { command } => {
             emit_result(commands::run_mcp_command(agent, &command, trust_project_mcp).await);
-            emit(&ClientEvent::Ready {
-                model: agent.model().to_owned(),
-                rag: boot::rag_label(rag_chunks),
-                mcp: boot::mcp_label(agent),
-            });
+            emit_ready(agent, rag_chunks);
         }
         SlashAction::Permissions => emit_result(commands::format_permissions(agent)),
         SlashAction::Permission { name, value } => {
@@ -165,7 +162,7 @@ async fn handle_user_input(
             agent.reset();
             emit_result("Asteria: 记忆已清空。");
         }
-        SlashAction::NewSession => reset_session(agent, pending, queued),
+        SlashAction::NewSession => create_session(agent, pending, queued),
         SlashAction::Cancel => emit(&ClientEvent::Log {
             text: "当前没有运行中的 Turn。".into(),
         }),
@@ -204,7 +201,12 @@ fn idle_command(
             None
         }
         RpcCommand::NewSession => {
-            reset_session(agent, pending, queued);
+            create_session(agent, pending, queued);
+            None
+        }
+        RpcCommand::SwitchSession { id } => {
+            emit_result(commands::switch_session(agent, &id));
+            emit_session_changed(agent, true);
             None
         }
         RpcCommand::Cancel => {
@@ -228,7 +230,7 @@ fn idle_command(
     }
 }
 
-fn reset_session(
+fn create_session(
     agent: &mut Asteria,
     pending: &mut HashMap<u64, oneshot::Sender<bool>>,
     queued: &mut VecDeque<String>,
@@ -238,11 +240,36 @@ fn reset_session(
     }
     queued.clear();
     match agent.new_session() {
-        Ok(()) => emit(&ClientEvent::SessionCleared),
+        Ok(_) => {
+            emit(&ClientEvent::SessionCleared);
+            emit_session_changed(agent, true);
+        }
         Err(error) => emit(&ClientEvent::Error {
             message: format!("{error:#}"),
         }),
     }
+}
+
+fn emit_ready(agent: &Asteria, rag_chunks: Option<usize>) {
+    let catalog = agent.session_catalog();
+    emit(&ClientEvent::Ready {
+        model: agent.model().to_owned(),
+        rag: boot::rag_label(rag_chunks),
+        mcp: boot::mcp_label(agent),
+        current_session: catalog.current_id,
+        sessions: catalog.sessions,
+    });
+}
+
+fn emit_session_changed(agent: &Asteria, reset_view: bool) {
+    let catalog = agent.session_catalog();
+    emit(&ClientEvent::SessionChanged {
+        current_id: catalog.current_id,
+        title: catalog.current_title,
+        message_count: catalog.message_count,
+        reset_view,
+        sessions: catalog.sessions,
+    });
 }
 
 async fn run_turn(
@@ -308,9 +335,10 @@ async fn run_turn(
                                 Some(SlashAction::ApprovalUsage) => {
                                     emit_result(commands::approval_usage());
                                 }
-                                Some(SlashAction::NewSession) => {
+                                Some(SlashAction::NewSession)
+                                | Some(SlashAction::Session { target: Some(_) }) => {
                                     emit(&ClientEvent::Log {
-                                        text: "当前回合进行中，结束后再新建会话。".into(),
+                                        text: "当前回合进行中，结束后再切换会话。".into(),
                                     });
                                 }
                                 Some(_) | None => {
@@ -324,9 +352,9 @@ async fn run_turn(
                                 }
                             }
                         }
-                        Some(RpcCommand::NewSession) => {
+                        Some(RpcCommand::NewSession | RpcCommand::SwitchSession { .. }) => {
                             emit(&ClientEvent::Log {
-                                text: "当前回合进行中，结束后再新建会话。".into(),
+                                text: "当前回合进行中，结束后再切换会话。".into(),
                             });
                         }
                         Some(_) => {}
@@ -348,6 +376,7 @@ async fn run_turn(
                     retries: turn.retries,
                 });
             }
+            emit_session_changed(agent, false);
         }
         Err(_)
             if agent
@@ -443,6 +472,7 @@ pub enum RpcCommand {
     Cancel,
     Status,
     NewSession,
+    SwitchSession { id: String },
     Unknown { method: String },
 }
 
@@ -481,6 +511,14 @@ pub fn parse_command(line: &str) -> Result<RpcCommand> {
         "cancel" => RpcCommand::Cancel,
         "status" => RpcCommand::Status,
         "new_session" => RpcCommand::NewSession,
+        "switch_session" => RpcCommand::SwitchSession {
+            id: wire
+                .params
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+        },
         other => RpcCommand::Unknown {
             method: other.to_owned(),
         },
@@ -494,6 +532,8 @@ enum ClientEvent {
         model: String,
         rag: String,
         mcp: String,
+        current_session: String,
+        sessions: Vec<SessionSummary>,
     },
     User {
         text: String,
@@ -532,6 +572,13 @@ enum ClientEvent {
     },
     TurnCancelled,
     SessionCleared,
+    SessionChanged {
+        current_id: String,
+        title: String,
+        message_count: usize,
+        reset_view: bool,
+        sessions: Vec<SessionSummary>,
+    },
     Error {
         message: String,
     },
@@ -645,6 +692,10 @@ mod tests {
         assert_eq!(
             parse_command(r#"{"method":"new_session"}"#).unwrap(),
             RpcCommand::NewSession
+        );
+        assert_eq!(
+            parse_command(r#"{"method":"switch_session","params":{"id":"s1"}}"#).unwrap(),
+            RpcCommand::SwitchSession { id: "s1".into() }
         );
     }
 
